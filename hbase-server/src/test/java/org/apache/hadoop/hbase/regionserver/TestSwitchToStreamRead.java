@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
+
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.HBaseClassTestRule;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
@@ -36,13 +37,14 @@ import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.TableDescriptorBuilder;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.filter.FilterBase;
+import org.apache.hadoop.hbase.io.hfile.ReaderContext.ReaderType;
 import org.apache.hadoop.hbase.regionserver.HRegion.RegionScannerImpl;
 import org.apache.hadoop.hbase.regionserver.ScannerContext.LimitScope;
 import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.testclassification.RegionServerTests;
 import org.apache.hadoop.hbase.util.Bytes;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
+import org.junit.After;
+import org.junit.Before;
 import org.junit.ClassRule;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -67,8 +69,8 @@ public class TestSwitchToStreamRead {
 
   private static HRegion REGION;
 
-  @BeforeClass
-  public static void setUp() throws IOException {
+  @Before
+  public void setUp() throws IOException {
     UTIL.getConfiguration().setLong(StoreScanner.STORESCANNER_PREAD_MAX_BYTES, 2048);
     StringBuilder sb = new StringBuilder(256);
     for (int i = 0; i < 255; i++) {
@@ -92,8 +94,8 @@ public class TestSwitchToStreamRead {
     }
   }
 
-  @AfterClass
-  public static void tearDown() throws IOException {
+  @After
+  public void tearDown() throws IOException {
     REGION.close(true);
     UTIL.cleanupTestDir();
   }
@@ -107,7 +109,8 @@ public class TestSwitchToStreamRead {
         if (kvs instanceof StoreFileScanner) {
           StoreFileScanner sfScanner = (StoreFileScanner) kvs;
           // starting from pread so we use shared reader here.
-          assertTrue(sfScanner.getReader().shared);
+          assertTrue(sfScanner.getReader().getReaderContext()
+            .getReaderType() == ReaderType.PREAD);
         }
       }
       List<Cell> cells = new ArrayList<>();
@@ -122,7 +125,8 @@ public class TestSwitchToStreamRead {
         if (kvs instanceof StoreFileScanner) {
           StoreFileScanner sfScanner = (StoreFileScanner) kvs;
           // we should have convert to use stream read now.
-          assertFalse(sfScanner.getReader().shared);
+          assertFalse(sfScanner.getReader().getReaderContext()
+            .getReaderType() == ReaderType.PREAD);
         }
       }
       for (int i = 500; i < 1000; i++) {
@@ -155,7 +159,8 @@ public class TestSwitchToStreamRead {
         if (kvs instanceof StoreFileScanner) {
           StoreFileScanner sfScanner = (StoreFileScanner) kvs;
           // starting from pread so we use shared reader here.
-          assertTrue(sfScanner.getReader().shared);
+          assertTrue(sfScanner.getReader().getReaderContext()
+            .getReaderType() == ReaderType.PREAD);
         }
       }
       List<Cell> cells = new ArrayList<>();
@@ -169,7 +174,8 @@ public class TestSwitchToStreamRead {
         if (kvs instanceof StoreFileScanner) {
           StoreFileScanner sfScanner = (StoreFileScanner) kvs;
           // we should have convert to use stream read now.
-          assertFalse(sfScanner.getReader().shared);
+          assertFalse(sfScanner.getReader().getReaderContext()
+            .getReaderType() == ReaderType.PREAD);
         }
       }
       assertFalse(scanner.next(cells,

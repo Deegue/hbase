@@ -45,13 +45,12 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Predicate;
-
 import org.apache.commons.io.IOUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.ClusterMetrics.Option;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.MetaTableAccessor;
+import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.client.Admin;
 import org.apache.hadoop.hbase.client.Connection;
@@ -272,7 +271,7 @@ public class RegionMover extends AbstractHBaseTool implements Closeable {
           LOG.info("Retry " + Integer.toString(count) + " of maximum " + Integer.toString(retries));
         }
         count = count + 1;
-        admin.move(region.getEncodedNameAsBytes(), Bytes.toBytes(targetServer.getServerName()));
+        admin.move(region.getEncodedNameAsBytes(), targetServer);
         long maxWait = startTime + (maxWaitInSeconds * 1000);
         while (EnvironmentEdgeManager.currentTime() < maxWait) {
           sameServer = isSameServer(region, sourceServer);
@@ -322,7 +321,7 @@ public class RegionMover extends AbstractHBaseTool implements Closeable {
       try {
         LOG.info("Moving region:" + region.getEncodedName() + " from " + sourceServer + " to "
             + targetServer);
-        admin.move(region.getEncodedNameAsBytes(), Bytes.toBytes(targetServer.getServerName()));
+        admin.move(region.getEncodedNameAsBytes(), targetServer);
         LOG.info("Moved " + region.getEncodedName() + " from " + sourceServer + " to "
             + targetServer);
       } catch (Exception e) {
@@ -417,11 +416,15 @@ public class RegionMover extends AbstractHBaseTool implements Closeable {
       try {
         // Get Online RegionServers
         List<ServerName> regionServers = new ArrayList<>();
-        regionServers.addAll(
-            admin.getClusterMetrics(EnumSet.of(Option.LIVE_SERVERS)).getLiveServerMetrics()
-                .keySet());
+        regionServers.addAll(admin.getRegionServers());
         // Remove the host Region server from target Region Servers list
         ServerName server = stripServer(regionServers, hostname, port);
+        if (server == null) {
+          LOG.info("Could not find server '{}:{}' in the set of region servers. giving up.",
+              hostname, port);
+          LOG.debug("List of region servers: {}", regionServers);
+          return false;
+        }
         // Remove RS present in the exclude file
         stripExcludes(regionServers);
         stripMaster(regionServers);
@@ -545,9 +548,7 @@ public class RegionMover extends AbstractHBaseTool implements Closeable {
     while (EnvironmentEdgeManager.currentTime() < maxWait) {
       try {
         List<ServerName> regionServers = new ArrayList<>();
-        regionServers.addAll(
-            admin.getClusterMetrics(EnumSet.of(Option.LIVE_SERVERS)).getLiveServerMetrics()
-                .keySet());
+        regionServers.addAll(admin.getRegionServers());
         // Remove the host Region server from target Region Servers list
         server = stripServer(regionServers, hostname, port);
         if (server != null) {
@@ -667,18 +668,15 @@ public class RegionMover extends AbstractHBaseTool implements Closeable {
    * @return server removed from list of Region Servers
    */
   private ServerName stripServer(List<ServerName> regionServers, String hostname, int port) {
-    ServerName server = null;
-    String portString = Integer.toString(port);
-    Iterator<ServerName> i = regionServers.iterator();
-    while (i.hasNext()) {
-      server = i.next();
-      String[] splitServer = server.getServerName().split(ServerName.SERVERNAME_SEPARATOR);
-      if (splitServer[0].equalsIgnoreCase(hostname) && splitServer[1].equals(portString)) {
-        i.remove();
+    for (Iterator<ServerName> iter = regionServers.iterator(); iter.hasNext();) {
+      ServerName server = iter.next();
+      if (server.getAddress().getHostname().equalsIgnoreCase(hostname) &&
+        server.getAddress().getPort() == port) {
+        iter.remove();
         return server;
       }
     }
-    return server;
+    return null;
   }
 
   /**
@@ -719,7 +717,13 @@ public class RegionMover extends AbstractHBaseTool implements Closeable {
     if (!admin.isTableEnabled(region.getTable())) {
       return null;
     }
-    return MetaTableAccessor.getRegionLocation(conn, region).getServerName();
+    HRegionLocation loc =
+      conn.getRegionLocator(region.getTable()).getRegionLocation(region.getStartKey(), true);
+    if (loc != null) {
+      return loc.getServerName();
+    } else {
+      return null;
+    }
   }
 
   @Override
@@ -782,6 +786,8 @@ public class RegionMover extends AbstractHBaseTool implements Closeable {
   }
 
   public static void main(String[] args) {
-    new RegionMover().doStaticMain(args);
+    try (RegionMover mover = new RegionMover()) {
+      mover.doStaticMain(args);
+    }
   }
 }

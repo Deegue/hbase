@@ -73,31 +73,39 @@ public final class ProcedureWALFormat {
 
   private ProcedureWALFormat() {}
 
+  /**
+   * Load all the procedures in these ProcedureWALFiles, and rebuild the given {@code tracker} if
+   * needed, i.e, the {@code tracker} is a partial one.
+   * <p/>
+   * The method in the give {@code loader} will be called at the end after we load all the
+   * procedures and construct the hierarchy.
+   * <p/>
+   * And we will call the {@link ProcedureStoreTracker#resetModified()} method for the given
+   * {@code tracker} before returning, as it will be used to track the next proc wal file's modified
+   * procedures.
+   */
   public static void load(Iterator<ProcedureWALFile> logs, ProcedureStoreTracker tracker,
       Loader loader) throws IOException {
     ProcedureWALFormatReader reader = new ProcedureWALFormatReader(tracker, loader);
     tracker.setKeepDeletes(true);
-    try {
-      // Ignore the last log which is current active log.
-      while (logs.hasNext()) {
-        ProcedureWALFile log = logs.next();
-        log.open();
-        try {
-          reader.read(log);
-        } finally {
-          log.close();
-        }
+    // Ignore the last log which is current active log.
+    while (logs.hasNext()) {
+      ProcedureWALFile log = logs.next();
+      log.open();
+      try {
+        reader.read(log);
+      } finally {
+        log.close();
       }
-      reader.finish();
-
-      // The tracker is now updated with all the procedures read from the logs
-      if (tracker.isPartial()) {
-        tracker.setPartialFlag(false);
-      }
-      tracker.resetModified();
-    } finally {
-      tracker.setKeepDeletes(false);
     }
+    reader.finish();
+
+    // The tracker is now updated with all the procedures read from the logs
+    if (tracker.isPartial()) {
+      tracker.setPartialFlag(false);
+    }
+    tracker.resetModified();
+    tracker.setKeepDeletes(false);
   }
 
   public static void writeHeader(OutputStream stream, ProcedureWALHeader header)

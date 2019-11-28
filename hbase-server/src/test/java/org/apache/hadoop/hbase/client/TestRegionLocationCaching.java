@@ -15,17 +15,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.hadoop.hbase.client;
 
 import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
-
 import org.apache.hadoop.hbase.HBaseClassTestRule;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.TableName;
@@ -47,7 +44,6 @@ public class TestRegionLocationCaching {
 
   private final static HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
   private static int SLAVES = 1;
-  private static int PER_REGIONSERVER_QUEUE_SIZE = 100000;
   private static TableName TABLE_NAME = TableName.valueOf("TestRegionLocationCaching");
   private static byte[] FAMILY = Bytes.toBytes("testFamily");
   private static byte[] QUALIFIER = Bytes.toBytes("testQualifier");
@@ -62,48 +58,6 @@ public class TestRegionLocationCaching {
   @AfterClass
   public static void tearDownAfterClass() throws Exception {
     TEST_UTIL.shutdownMiniCluster();
-  }
-
-  @Test
-  public void testCachingForHTableMultiplexerSinglePut() throws Exception {
-    HTableMultiplexer multiplexer =
-        new HTableMultiplexer(TEST_UTIL.getConfiguration(), PER_REGIONSERVER_QUEUE_SIZE);
-    byte[] row = Bytes.toBytes("htable_multiplexer_single_put");
-    byte[] value = Bytes.toBytes("value");
-
-    Put put = new Put(row);
-    put.addColumn(FAMILY, QUALIFIER, value);
-    assertTrue("Put request not accepted by multiplexer queue", multiplexer.put(TABLE_NAME, put));
-
-    checkRegionLocationIsCached(TABLE_NAME, multiplexer.getConnection());
-    checkExistence(TABLE_NAME, row, FAMILY, QUALIFIER);
-
-    multiplexer.close();
-  }
-
-  @Test
-  public void testCachingForHTableMultiplexerMultiPut() throws Exception {
-    HTableMultiplexer multiplexer =
-        new HTableMultiplexer(TEST_UTIL.getConfiguration(), PER_REGIONSERVER_QUEUE_SIZE);
-
-    List<Put> multiput = new ArrayList<Put>();
-    for (int i = 0; i < 10; i++) {
-      Put put = new Put(Bytes.toBytes("htable_multiplexer_multi_put" + i));
-      byte[] value = Bytes.toBytes("value_" + i);
-      put.addColumn(FAMILY, QUALIFIER, value);
-      multiput.add(put);
-    }
-
-    List<Put> failedPuts = multiplexer.put(TABLE_NAME, multiput);
-    assertNull("All put requests were not accepted by multiplexer queue", failedPuts);
-
-    checkRegionLocationIsCached(TABLE_NAME, multiplexer.getConnection());
-    for (int i = 0; i < 10; i++) {
-      checkExistence(TABLE_NAME, Bytes.toBytes("htable_multiplexer_multi_put" + i), FAMILY,
-        QUALIFIER);
-    }
-
-    multiplexer.close();
   }
 
   @Test
@@ -149,7 +103,8 @@ public class TestRegionLocationCaching {
   private void checkRegionLocationIsCached(final TableName tableName, final Connection conn)
       throws InterruptedException, IOException {
     for (int count = 0; count < 50; count++) {
-      int number = ((ConnectionImplementation) conn).getNumberOfCachedRegionLocations(tableName);
+      int number = ((AsyncConnectionImpl) conn.toAsyncConnection()).getLocator()
+        .getNumberOfCachedRegionLocations(tableName);
       assertNotEquals("Expected non-zero number of cached region locations", 0, number);
       Thread.sleep(100);
     }

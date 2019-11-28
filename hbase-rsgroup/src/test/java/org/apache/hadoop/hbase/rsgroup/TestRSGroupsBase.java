@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.rsgroup;
 import static org.junit.Assert.assertTrue;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.LinkedList;
@@ -29,7 +30,7 @@ import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
-
+import java.util.regex.Pattern;
 import org.apache.hadoop.hbase.ClusterMetrics;
 import org.apache.hadoop.hbase.ClusterMetrics.Option;
 import org.apache.hadoop.hbase.HBaseCluster;
@@ -37,8 +38,6 @@ import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.MiniHBaseCluster;
 import org.apache.hadoop.hbase.NamespaceDescriptor;
-import org.apache.hadoop.hbase.RegionMetrics;
-import org.apache.hadoop.hbase.ServerMetrics;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.Waiter;
@@ -55,8 +54,6 @@ import org.apache.hadoop.hbase.master.MasterCoprocessorHost;
 import org.apache.hadoop.hbase.master.ServerManager;
 import org.apache.hadoop.hbase.master.snapshot.SnapshotManager;
 import org.apache.hadoop.hbase.net.Address;
-import org.apache.hadoop.hbase.util.Bytes;
-
 import org.junit.Rule;
 import org.junit.rules.TestName;
 import org.slf4j.Logger;
@@ -79,11 +76,11 @@ public abstract class TestRSGroupsBase {
   protected static HBaseCluster cluster;
   protected static RSGroupAdmin rsGroupAdmin;
   protected static HMaster master;
-  protected static boolean INIT = false;
+  protected boolean INIT = false;
   protected static RSGroupAdminEndpoint rsGroupAdminEndpoint;
   protected static CPMasterObserver observer;
 
-  public final static long WAIT_TIMEOUT = 60000*5;
+  public final static long WAIT_TIMEOUT = 60000;
   public final static int NUM_SLAVES_BASE = 4; //number of slaves for the smallest cluster
   public static int NUM_DEAD_SERVERS = 0;
 
@@ -101,18 +98,20 @@ public abstract class TestRSGroupsBase {
         RSGroupBasedLoadBalancer.class.getName());
     TEST_UTIL.getConfiguration().set(CoprocessorHost.MASTER_COPROCESSOR_CONF_KEY,
         RSGroupAdminEndpoint.class.getName() + "," + CPMasterObserver.class.getName());
-    TEST_UTIL.startMiniCluster(NUM_SLAVES_BASE - 1);
     TEST_UTIL.getConfiguration().setInt(
         ServerManager.WAIT_ON_REGIONSERVERS_MINTOSTART,
         NUM_SLAVES_BASE - 1);
     TEST_UTIL.getConfiguration().setBoolean(SnapshotManager.HBASE_SNAPSHOT_ENABLED, true);
+    TEST_UTIL.getConfiguration().setInt("hbase.rpc.timeout", 100000);
+
+    TEST_UTIL.startMiniCluster(NUM_SLAVES_BASE - 1);
     initialize();
   }
 
   protected static void initialize() throws Exception {
     admin = TEST_UTIL.getAdmin();
     cluster = TEST_UTIL.getHBaseCluster();
-    master = ((MiniHBaseCluster)cluster).getMaster();
+    master = TEST_UTIL.getMiniHBaseCluster().getMaster();
 
     //wait for balancer to come online
     TEST_UTIL.waitFor(WAIT_TIMEOUT, new Waiter.Predicate<Exception>() {
@@ -122,7 +121,7 @@ public abstract class TestRSGroupsBase {
             ((RSGroupBasedLoadBalancer) master.getLoadBalancer()).isOnline();
       }
     });
-    admin.setBalancerRunning(false,true);
+    admin.balancerSwitch(false, true);
     rsGroupAdmin = new VerifyingRSGroupAdminClient(
         new RSGroupAdminClient(TEST_UTIL.getConnection()), TEST_UTIL.getConfiguration());
     MasterCoprocessorHost host = master.getMasterCoprocessorHost();
@@ -184,7 +183,7 @@ public abstract class TestRSGroupsBase {
     });
   }
 
-  public RSGroupInfo addGroup(String groupName, int serverCount)
+  protected RSGroupInfo addGroup(String groupName, int serverCount)
       throws IOException, InterruptedException {
     RSGroupInfo defaultInfo = rsGroupAdmin.getRSGroupInfo(RSGroupInfo.DEFAULT_GROUP);
     rsGroupAdmin.addRSGroup(groupName);
@@ -200,20 +199,21 @@ public abstract class TestRSGroupsBase {
     return result;
   }
 
-  public void removeGroup(String groupName) throws IOException {
+  protected void removeGroup(String groupName) throws IOException {
     RSGroupInfo groupInfo = rsGroupAdmin.getRSGroupInfo(groupName);
     rsGroupAdmin.moveTables(groupInfo.getTables(), RSGroupInfo.DEFAULT_GROUP);
     rsGroupAdmin.moveServers(groupInfo.getServers(), RSGroupInfo.DEFAULT_GROUP);
     rsGroupAdmin.removeRSGroup(groupName);
   }
 
-  public void deleteTableIfNecessary() throws IOException {
-    for (TableDescriptor desc : TEST_UTIL.getAdmin().listTables(tablePrefix+".*")) {
+  protected void deleteTableIfNecessary() throws IOException {
+    for (TableDescriptor desc : TEST_UTIL.getAdmin()
+      .listTableDescriptors(Pattern.compile(tablePrefix + ".*"))) {
       TEST_UTIL.deleteTable(desc.getTableName());
     }
   }
 
-  public void deleteNamespaceIfNecessary() throws IOException {
+  protected void deleteNamespaceIfNecessary() throws IOException {
     for (NamespaceDescriptor desc : TEST_UTIL.getAdmin().listNamespaceDescriptors()) {
       if(desc.getName().startsWith(tablePrefix)) {
         admin.deleteNamespace(desc.getName());
@@ -221,7 +221,7 @@ public abstract class TestRSGroupsBase {
     }
   }
 
-  public void deleteGroups() throws IOException {
+  protected void deleteGroups() throws IOException {
     RSGroupAdmin groupAdmin = new RSGroupAdminClient(TEST_UTIL.getConnection());
     for(RSGroupInfo group: groupAdmin.listRSGroups()) {
       if(!group.getName().equals(RSGroupInfo.DEFAULT_GROUP)) {
@@ -232,7 +232,7 @@ public abstract class TestRSGroupsBase {
     }
   }
 
-  public Map<TableName, List<String>> getTableRegionMap() throws IOException {
+  protected Map<TableName, List<String>> getTableRegionMap() throws IOException {
     Map<TableName, List<String>> map = Maps.newTreeMap();
     Map<TableName, Map<ServerName, List<String>>> tableServerRegionMap
         = getTableServerRegionMap();
@@ -247,35 +247,24 @@ public abstract class TestRSGroupsBase {
     return map;
   }
 
-  public Map<TableName, Map<ServerName, List<String>>> getTableServerRegionMap()
-      throws IOException {
+  protected Map<TableName, Map<ServerName, List<String>>> getTableServerRegionMap()
+    throws IOException {
     Map<TableName, Map<ServerName, List<String>>> map = Maps.newTreeMap();
-    ClusterMetrics status = TEST_UTIL.getHBaseClusterInterface().getClusterMetrics();
-    for (Map.Entry<ServerName, ServerMetrics> entry : status.getLiveServerMetrics().entrySet()) {
-      ServerName serverName = entry.getKey();
-      for(RegionMetrics rl : entry.getValue().getRegionMetrics().values()) {
-        TableName tableName = null;
-        try {
-          tableName = RegionInfo.getTable(rl.getRegionName());
-        } catch (IllegalArgumentException e) {
-          LOG.warn("Failed parse a table name from regionname=" +
-            Bytes.toStringBinary(rl.getRegionName()));
-          continue;
-        }
-        if(!map.containsKey(tableName)) {
-          map.put(tableName, new TreeMap<>());
-        }
-        if(!map.get(tableName).containsKey(serverName)) {
-          map.get(tableName).put(serverName, new LinkedList<>());
-        }
-        map.get(tableName).get(serverName).add(rl.getNameAsString());
+    Admin admin = TEST_UTIL.getAdmin();
+    ClusterMetrics metrics =
+      admin.getClusterMetrics(EnumSet.of(ClusterMetrics.Option.SERVERS_NAME));
+    for (ServerName serverName : metrics.getServersName()) {
+      for (RegionInfo region : admin.getRegions(serverName)) {
+        TableName tableName = region.getTable();
+        map.computeIfAbsent(tableName, k -> new TreeMap<>())
+          .computeIfAbsent(serverName, k -> new ArrayList<>()).add(region.getRegionNameAsString());
       }
     }
     return map;
   }
 
   // return the real number of region servers, excluding the master embedded region server in 2.0+
-  public int getNumServers() throws IOException {
+  protected int getNumServers() throws IOException {
     ClusterMetrics status =
         admin.getClusterMetrics(EnumSet.of(Option.MASTER, Option.LIVE_SERVERS));
     ServerName masterName = status.getMasterName();
@@ -288,8 +277,18 @@ public abstract class TestRSGroupsBase {
     return count;
   }
 
-  public String getGroupName(String baseName) {
-    return groupPrefix+"_"+baseName+"_"+rand.nextInt(Integer.MAX_VALUE);
+  protected String getGroupName(String baseName) {
+    return groupPrefix + "_" + baseName + "_" + rand.nextInt(Integer.MAX_VALUE);
+  }
+
+  /**
+   * The server name in group does not contain the start code, this method will find out the start
+   * code and construct the ServerName object.
+   */
+  protected ServerName getServerName(Address addr) {
+    return TEST_UTIL.getMiniHBaseCluster().getRegionServerThreads().stream()
+      .map(t -> t.getRegionServer().getServerName()).filter(sn -> sn.getAddress().equals(addr))
+      .findFirst().get();
   }
 
   public static class CPMasterObserver implements MasterCoprocessor, MasterObserver {

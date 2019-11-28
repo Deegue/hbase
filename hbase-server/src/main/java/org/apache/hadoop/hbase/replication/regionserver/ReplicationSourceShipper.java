@@ -17,6 +17,7 @@
  */
 package org.apache.hadoop.hbase.replication.regionserver;
 
+import static org.apache.hadoop.hbase.replication.ReplicationUtils.getAdaptiveTimeout;
 import static org.apache.hadoop.hbase.replication.ReplicationUtils.sleepForRetries;
 
 import java.io.IOException;
@@ -26,9 +27,9 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellUtil;
+import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.replication.ReplicationEndpoint;
-import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.hbase.wal.WAL.Entry;
 import org.apache.hadoop.hbase.wal.WALEdit;
@@ -74,6 +75,7 @@ public class ReplicationSourceShipper extends Thread {
   protected final int maxRetriesMultiplier;
   private final int DEFAULT_TIMEOUT = 20000;
   private final int getEntriesTimeout;
+  private final int shipEditsTimeout;
 
   public ReplicationSourceShipper(Configuration conf, String walGroupId,
       PriorityBlockingQueue<Path> queue, ReplicationSource source) {
@@ -87,11 +89,14 @@ public class ReplicationSourceShipper extends Thread {
         this.conf.getInt("replication.source.maxretriesmultiplier", 300); // 5 minutes @ 1 sec per
     this.getEntriesTimeout =
         this.conf.getInt("replication.source.getEntries.timeout", DEFAULT_TIMEOUT); // 20 seconds
+    this.shipEditsTimeout = this.conf.getInt(HConstants.REPLICATION_SOURCE_SHIPEDITS_TIMEOUT,
+        HConstants.REPLICATION_SOURCE_SHIPEDITS_TIMEOUT_DFAULT);
   }
 
   @Override
   public final void run() {
     setWorkerState(WorkerState.RUNNING);
+    LOG.info("Running ReplicationSourceShipper Thread for wal group: {}", this.walGroupId);
     // Loop until we close down
     while (isActive()) {
       // Sleep until replication is enabled again
@@ -103,10 +108,9 @@ public class ReplicationSourceShipper extends Thread {
       }
       try {
         WALEntryBatch entryBatch = entryReader.poll(getEntriesTimeout);
+        LOG.debug("Shipper from source {} got entry batch from reader: {}",
+            source.getQueueId(), entryBatch);
         if (entryBatch == null) {
-          // since there is no logs need to replicate, we refresh the ageOfLastShippedOp
-          source.getSourceMetrics().setAgeOfLastShippedOp(EnvironmentEdgeManager.currentTime(),
-            walGroupId);
           continue;
         }
         // the NO_MORE_DATA instance has no path so do not call shipEdits
@@ -163,16 +167,13 @@ public class ReplicationSourceShipper extends Thread {
     List<Entry> entries = entryBatch.getWalEntries();
     int sleepMultiplier = 0;
     if (entries.isEmpty()) {
-      if (updateLogPosition(entryBatch)) {
-        // if there was nothing to ship and it's not an error
-        // set "ageOfLastShippedOp" to <now> to indicate that we're current
-        source.getSourceMetrics().setAgeOfLastShippedOp(EnvironmentEdgeManager.currentTime(),
-          walGroupId);
-      }
+      updateLogPosition(entryBatch);
       return;
     }
     int currentSize = (int) entryBatch.getHeapSize();
     int sizeExcludeBulkLoad = getBatchEntrySizeExcludeBulkLoad(entryBatch);
+    source.getSourceMetrics().setTimeStampNextToReplicate(entries.get(entries.size() - 1)
+        .getKey().getWriteTime());
     while (isActive()) {
       try {
         try {
@@ -184,13 +185,13 @@ public class ReplicationSourceShipper extends Thread {
           // directly go back to while() for confirm this
           continue;
         }
-
         // create replicateContext here, so the entries can be GC'd upon return from this call
         // stack
         ReplicationEndpoint.ReplicateContext replicateContext =
             new ReplicationEndpoint.ReplicateContext();
         replicateContext.setEntries(entries).setSize(currentSize);
         replicateContext.setWalGroupId(walGroupId);
+        replicateContext.setTimeout(getAdaptiveTimeout(this.shipEditsTimeout, sleepMultiplier));
 
         long startTimeNs = System.nanoTime();
         // send the edits to the endpoint. Will block until the edits are shipped and acknowledged
@@ -205,7 +206,7 @@ public class ReplicationSourceShipper extends Thread {
         // Clean up hfile references
         for (Entry entry : entries) {
           cleanUpHFileRefs(entry.getEdit());
-
+          LOG.trace("shipped entry {}: ", entry);
           TableName tableName = entry.getKey().getTableName();
           source.getSourceMetrics().setAgeOfLastShippedOpByTable(entry.getKey().getWriteTime(),
               tableName.getNameAsString());
@@ -224,7 +225,7 @@ public class ReplicationSourceShipper extends Thread {
         source.getSourceMetrics().setAgeOfLastShippedOp(
           entries.get(entries.size() - 1).getKey().getWriteTime(), walGroupId);
         if (LOG.isTraceEnabled()) {
-          LOG.trace("Replicated {} entries or {} operations in {} ms",
+          LOG.debug("Replicated {} entries or {} operations in {} ms",
               entries.size(), entryBatch.getNbOperations(), (endTimeNs - startTimeNs) / 1000000);
         }
         break;
@@ -309,7 +310,7 @@ public class ReplicationSourceShipper extends Thread {
     return 0;
   }
 
-  private boolean isActive() {
+  protected boolean isActive() {
     return source.isSourceActive() && state == WorkerState.RUNNING && !isInterrupted();
   }
 

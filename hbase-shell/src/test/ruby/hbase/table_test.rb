@@ -476,6 +476,16 @@ module Hbase
       assert_not_nil(res['2']['x:b'])
     end
 
+    define_test "scan should support STARTKEY parameter" do
+      res = @test_table._scan_internal STARTKEY => '2'
+      assert_not_nil(res)
+      assert_kind_of(Hash, res)
+      assert_nil(res['1'])
+      assert_not_nil(res['2'])
+      assert_not_nil(res['2']['x:a'])
+      assert_not_nil(res['2']['x:b'])
+    end
+
     define_test "scan should support STOPROW parameter" do
       res = @test_table._scan_internal STOPROW => '2'
       assert_not_nil(res)
@@ -486,7 +496,27 @@ module Hbase
       assert_nil(res['2'])
     end
 
-    define_test "scan should support ROWPREFIXFILTER parameter (test 1)" do
+    define_test "scan should support ENDROW parameter" do
+      res = @test_table._scan_internal ENDROW => '2'
+      assert_not_nil(res)
+      assert_kind_of(Hash, res)
+      assert_not_nil(res['1'])
+      assert_not_nil(res['1']['x:a'])
+      assert_not_nil(res['1']['x:b'])
+      assert_nil(res['2'])
+    end
+
+    define_test "scan should support ENDKEY parameter" do
+      res = @test_table._scan_internal ENDKEY => '2'
+      assert_not_nil(res)
+      assert_kind_of(Hash, res)
+      assert_not_nil(res['1'])
+      assert_not_nil(res['1']['x:a'])
+      assert_not_nil(res['1']['x:b'])
+      assert_nil(res['2'])
+    end
+
+    define_test 'scan should support ROWPREFIXFILTER parameter (test 1)' do
       res = @test_table._scan_internal ROWPREFIXFILTER => '1'
       assert_not_nil(res)
       assert_kind_of(Hash, res)
@@ -496,7 +526,7 @@ module Hbase
       assert_nil(res['2'])
     end
 
-    define_test "scan should support ROWPREFIXFILTER parameter (test 2)" do
+    define_test 'scan should support ROWPREFIXFILTER parameter (test 2)' do
       res = @test_table._scan_internal ROWPREFIXFILTER => '2'
       assert_not_nil(res)
       assert_kind_of(Hash, res)
@@ -506,7 +536,7 @@ module Hbase
       assert_not_nil(res['2']['x:b'])
     end
 
-    define_test "scan should support LIMIT parameter" do
+    define_test 'scan should support LIMIT parameter' do
       res = @test_table._scan_internal LIMIT => 1
       assert_not_nil(res)
       assert_kind_of(Hash, res)
@@ -570,6 +600,30 @@ module Hbase
       assert_not_nil(res['2'])
       assert_not_nil(res['2']['x:a'])
       assert_nil(res['2']['x:b'])
+    end
+
+    define_test 'scan should support REGION_REPLICA_ID' do
+      res = @test_table._scan_internal REGION_REPLICA_ID => 0
+      assert_not_nil(res)
+    end
+
+    define_test 'scan should support ISOLATION_LEVEL' do
+      res = @test_table._scan_internal ISOLATION_LEVEL => 'READ_COMMITTED'
+      assert_not_nil(res)
+    end
+
+    define_test 'scan should support READ_TYPE parameter' do
+      res = @test_table._scan_internal READ_TYPE => 'PREAD'
+      assert_not_nil(res)
+      res = @test_table._scan_internal READ_TYPE => 'STREAM'
+      assert_not_nil(res)
+      res = @test_table._scan_internal READ_TYPE => 'DEFAULT'
+      assert_not_nil(res)
+    end
+
+    define_test 'scan should support ALLOW_PARTIAL_RESULTS' do
+      res = @test_table._scan_internal ALLOW_PARTIAL_RESULTS => true
+      assert_not_nil(res)
     end
 
     define_test "scan should work with raw and version parameter" do
@@ -722,20 +776,38 @@ module Hbase
       end
     end
 
-    define_test "Split count for a table" do
-      @testTableName = "tableWithSplits"
-      create_test_table_with_splits(@testTableName, SPLITS => ['10', '20', '30', '40'])
-      @table = table(@testTableName)
-      splits = @table._get_splits_internal()
-      #Total splits is 5 but here count is 4 as we ignore implicit empty split.
+    define_test 'Split count for a table' do
+      @test_table_name = 'table_with_splits'
+      create_test_table_with_splits(@test_table_name, SPLITS => %w[10 20 30 40])
+      @table = table(@test_table_name)
+      splits = @table._get_splits_internal
+      # Total splits is 5 but here count is 4 as we ignore implicit empty split.
       assert_equal(4, splits.size)
-      assert_equal(["10", "20", "30", "40"], splits)
-      drop_test_table(@testTableName)
+      assert_equal(%w[10 20 30 40], splits)
+      drop_test_table(@test_table_name)
     end
 
-    define_test "Split count for a empty table" do
-      splits = @test_table._get_splits_internal()
-      #Empty split should not be part of this array.
+    define_test 'Split count for a table by file' do
+      @test_table_name = 'table_with_splits_file'
+      @splits_file = 'target/generated-test-sources/splits.txt'
+      File.exist?(@splits_file) && File.delete(@splits_file)
+      file = File.new(@splits_file, 'w')
+      %w[10 20 30 40].each { |item| file.puts item }
+      file.close
+      create_test_table_with_splits_file(@test_table_name,
+                                         SPLITS_FILE => @splits_file)
+      @table = table(@test_table_name)
+      splits = @table._get_splits_internal
+      # Total splits is 5 but here count is 4 as we ignore implicit empty split.
+      assert_equal(4, splits.size)
+      assert_equal(%w[10 20 30 40], splits)
+      drop_test_table(@test_table_name)
+      File.delete(@splits_file)
+    end
+
+    define_test 'Split count for a empty table' do
+      splits = @test_table._get_splits_internal
+      # Empty split should not be part of this array.
       assert_equal(0, splits.size)
       assert_equal([], splits)
     end

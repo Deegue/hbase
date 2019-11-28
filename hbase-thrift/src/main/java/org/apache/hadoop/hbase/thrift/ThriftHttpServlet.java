@@ -18,9 +18,6 @@
 
 package org.apache.hadoop.hbase.thrift;
 
-import static org.apache.hadoop.hbase.thrift.ThriftServerRunner.THRIFT_SPNEGO_KEYTAB_FILE_KEY;
-import static org.apache.hadoop.hbase.thrift.ThriftServerRunner.THRIFT_SPNEGO_PRINCIPAL_KEY;
-
 import java.io.IOException;
 import java.security.PrivilegedExceptionAction;
 import java.util.Base64;
@@ -29,7 +26,6 @@ import javax.servlet.ServletException;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
-import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.security.SecurityUtil;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.authorize.AuthorizationException;
@@ -58,7 +54,7 @@ public class ThriftHttpServlet extends TServlet {
   private static final Logger LOG = LoggerFactory.getLogger(ThriftHttpServlet.class.getName());
   private final transient UserGroupInformation serviceUGI;
   private final transient UserGroupInformation httpUGI;
-  private final transient ThriftServerRunner.HBaseHandler hbaseHandler;
+  private final transient HBaseServiceHandler handler;
   private final boolean doAsEnabled;
   private final boolean securityEnabled;
 
@@ -66,25 +62,14 @@ public class ThriftHttpServlet extends TServlet {
   public static final String NEGOTIATE = "Negotiate";
 
   public ThriftHttpServlet(TProcessor processor, TProtocolFactory protocolFactory,
-      UserGroupInformation serviceUGI, Configuration conf,
-      ThriftServerRunner.HBaseHandler hbaseHandler, boolean securityEnabled, boolean doAsEnabled)
-      throws IOException {
+      UserGroupInformation serviceUGI, UserGroupInformation httpUGI,
+      HBaseServiceHandler handler, boolean securityEnabled, boolean doAsEnabled) {
     super(processor, protocolFactory);
     this.serviceUGI = serviceUGI;
-    this.hbaseHandler = hbaseHandler;
+    this.httpUGI = httpUGI;
+    this.handler = handler;
     this.securityEnabled = securityEnabled;
     this.doAsEnabled = doAsEnabled;
-
-    if (securityEnabled) {
-      // login the spnego principal
-      UserGroupInformation.setConfiguration(conf);
-      this.httpUGI = UserGroupInformation.loginUserFromKeytabAndReturnUGI(
-          conf.get(THRIFT_SPNEGO_PRINCIPAL_KEY),
-          conf.get(THRIFT_SPNEGO_KEYTAB_FILE_KEY)
-      );
-    } else {
-      this.httpUGI = null;
-    }
   }
 
   @Override
@@ -146,7 +131,7 @@ public class ThriftHttpServlet extends TServlet {
       }
       effectiveUser = doAsUserFromQuery;
     }
-    hbaseHandler.setEffectiveUser(effectiveUser);
+    handler.setEffectiveUser(effectiveUser);
     super.doPost(request, response);
   }
 

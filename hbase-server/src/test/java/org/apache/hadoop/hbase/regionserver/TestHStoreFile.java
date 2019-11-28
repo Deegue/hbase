@@ -51,16 +51,21 @@ import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.RegionInfoBuilder;
 import org.apache.hadoop.hbase.client.Scan;
+import org.apache.hadoop.hbase.io.FSDataInputStreamWrapper;
 import org.apache.hadoop.hbase.io.HFileLink;
 import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;
 import org.apache.hadoop.hbase.io.hfile.BlockCache;
+import org.apache.hadoop.hbase.io.hfile.BlockCacheFactory;
 import org.apache.hadoop.hbase.io.hfile.CacheConfig;
 import org.apache.hadoop.hbase.io.hfile.CacheStats;
 import org.apache.hadoop.hbase.io.hfile.HFileContext;
 import org.apache.hadoop.hbase.io.hfile.HFileContextBuilder;
 import org.apache.hadoop.hbase.io.hfile.HFileDataBlockEncoder;
 import org.apache.hadoop.hbase.io.hfile.HFileDataBlockEncoderImpl;
+import org.apache.hadoop.hbase.io.hfile.HFileInfo;
 import org.apache.hadoop.hbase.io.hfile.HFileScanner;
+import org.apache.hadoop.hbase.io.hfile.ReaderContext;
+import org.apache.hadoop.hbase.io.hfile.ReaderContextBuilder;
 import org.apache.hadoop.hbase.testclassification.RegionServerTests;
 import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.apache.hadoop.hbase.util.BloomFilterFactory;
@@ -91,7 +96,7 @@ public class TestHStoreFile extends HBaseTestCase {
 
   private static final Logger LOG = LoggerFactory.getLogger(TestHStoreFile.class);
   private static final HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
-  private CacheConfig cacheConf =  new CacheConfig(TEST_UTIL.getConfiguration());
+  private CacheConfig cacheConf = new CacheConfig(TEST_UTIL.getConfiguration());
   private static String ROOT_DIR = TEST_UTIL.getDataTestDir("TestStoreFile").toString();
   private static final ChecksumType CKTYPE = ChecksumType.CRC32C;
   private static final int CKBYTES = 512;
@@ -280,9 +285,8 @@ public class TestHStoreFile extends HBaseTestCase {
                   HFileLink.createHFileLinkName(hri, storeFilePath.getName()));
 
     // Try to open store file from link
-    StoreFileInfo storeFileInfo = new StoreFileInfo(testConf, this.fs, linkFilePath);
-    HStoreFile hsf =
-        new HStoreFile(this.fs, storeFileInfo, testConf, cacheConf, BloomType.NONE, true);
+    StoreFileInfo storeFileInfo = new StoreFileInfo(testConf, this.fs, linkFilePath, true);
+    HStoreFile hsf = new HStoreFile(storeFileInfo, BloomType.NONE, cacheConf);
     assertTrue(storeFileInfo.isLink());
     hsf.initReader();
 
@@ -549,8 +553,11 @@ public class TestHStoreFile extends HBaseTestCase {
     }
     writer.close();
 
+    ReaderContext context = new ReaderContextBuilder().withFileSystemAndPath(fs, f).build();
+    HFileInfo fileInfo = new HFileInfo(context, conf);
     StoreFileReader reader =
-        new StoreFileReader(fs, f, cacheConf, true, new AtomicInteger(0), true, conf);
+        new StoreFileReader(context, fileInfo, cacheConf, new AtomicInteger(0), conf);
+    fileInfo.initMetaAndIndex(reader.getHFileReader());
     reader.loadFileInfo();
     reader.loadBloomfilter();
     StoreFileScanner scanner = getStoreFileScanner(reader, false, false);
@@ -637,8 +644,11 @@ public class TestHStoreFile extends HBaseTestCase {
     }
     writer.close();
 
+    ReaderContext context = new ReaderContextBuilder().withFileSystemAndPath(fs, f).build();
+    HFileInfo fileInfo = new HFileInfo(context, conf);
     StoreFileReader reader =
-        new StoreFileReader(fs, f, cacheConf, true, new AtomicInteger(0), true, conf);
+        new StoreFileReader(context, fileInfo, cacheConf, new AtomicInteger(0), conf);
+    fileInfo.initMetaAndIndex(reader.getHFileReader());
     reader.loadFileInfo();
     reader.loadBloomfilter();
 
@@ -683,8 +693,11 @@ public class TestHStoreFile extends HBaseTestCase {
     writeStoreFile(writer);
     writer.close();
 
+    ReaderContext context = new ReaderContextBuilder().withFileSystemAndPath(fs, f).build();
+    HFileInfo fileInfo = new HFileInfo(context, conf);
     StoreFileReader reader =
-        new StoreFileReader(fs, f, cacheConf, true, new AtomicInteger(0), true, conf);
+        new StoreFileReader(context, fileInfo, cacheConf, new AtomicInteger(0), conf);
+    fileInfo.initMetaAndIndex(reader.getHFileReader());
 
     // Now do reseek with empty KV to position to the beginning of the file
 
@@ -743,8 +756,16 @@ public class TestHStoreFile extends HBaseTestCase {
       }
       writer.close();
 
+      ReaderContext context = new ReaderContextBuilder()
+          .withFilePath(f)
+          .withFileSize(fs.getFileStatus(f).getLen())
+          .withFileSystem(fs)
+          .withInputStreamWrapper(new FSDataInputStreamWrapper(fs, f))
+          .build();
+      HFileInfo fileInfo = new HFileInfo(context, conf);
       StoreFileReader reader =
-          new StoreFileReader(fs, f, cacheConf, true, new AtomicInteger(0), true, conf);
+          new StoreFileReader(context, fileInfo, cacheConf, new AtomicInteger(0), conf);
+      fileInfo.initMetaAndIndex(reader.getHFileReader());
       reader.loadFileInfo();
       reader.loadBloomfilter();
       StoreFileScanner scanner = getStoreFileScanner(reader, false, false);
@@ -843,7 +864,7 @@ public class TestHStoreFile extends HBaseTestCase {
    * @param numRows
    * @param qualifier
    * @param family
-   * @return
+   * @return the rows key-value list
    */
   List<KeyValue> getKeyValueSet(long[] timestamps, int numRows,
       byte[] qualifier, byte[] family) {
@@ -924,7 +945,6 @@ public class TestHStoreFile extends HBaseTestCase {
     scan.setTimeRange(27, 50);
     scan.setColumnFamilyTimeRange(family, 7, 50);
     assertTrue(scanner.shouldUseScanner(scan, store, Long.MIN_VALUE));
-
   }
 
   @Test
@@ -935,7 +955,7 @@ public class TestHStoreFile extends HBaseTestCase {
     Path baseDir = new Path(new Path(testDir, "7e0102"),"twoCOWEOC");
 
     // Grab the block cache and get the initial hit/miss counts
-    BlockCache bc = new CacheConfig(conf).getBlockCache();
+    BlockCache bc = BlockCacheFactory.createBlockCache(conf);
     assertNotNull(bc);
     CacheStats cs = bc.getStats();
     long startHit = cs.getHitCount();
@@ -944,7 +964,7 @@ public class TestHStoreFile extends HBaseTestCase {
 
     // Let's write a StoreFile with three blocks, with cache on write off
     conf.setBoolean(CacheConfig.CACHE_BLOCKS_ON_WRITE_KEY, false);
-    CacheConfig cacheConf = new CacheConfig(conf);
+    CacheConfig cacheConf = new CacheConfig(conf, bc);
     Path pathCowOff = new Path(baseDir, "123456789");
     StoreFileWriter writer = writeStoreFile(conf, cacheConf, pathCowOff, 3);
     HStoreFile hsf = new HStoreFile(this.fs, writer.getPath(), conf, cacheConf,
@@ -967,7 +987,7 @@ public class TestHStoreFile extends HBaseTestCase {
 
     // Now write a StoreFile with three blocks, with cache on write on
     conf.setBoolean(CacheConfig.CACHE_BLOCKS_ON_WRITE_KEY, true);
-    cacheConf = new CacheConfig(conf);
+    cacheConf = new CacheConfig(conf, bc);
     Path pathCowOn = new Path(baseDir, "123456788");
     writer = writeStoreFile(conf, cacheConf, pathCowOn, 3);
     hsf = new HStoreFile(this.fs, writer.getPath(), conf, cacheConf,
@@ -1025,7 +1045,7 @@ public class TestHStoreFile extends HBaseTestCase {
 
     // Let's close the first file with evict on close turned on
     conf.setBoolean("hbase.rs.evictblocksonclose", true);
-    cacheConf = new CacheConfig(conf);
+    cacheConf = new CacheConfig(conf, bc);
     hsf = new HStoreFile(this.fs, pathCowOff, conf, cacheConf, BloomType.NONE, true);
     hsf.initReader();
     reader = hsf.getReader();
@@ -1039,7 +1059,7 @@ public class TestHStoreFile extends HBaseTestCase {
 
     // Let's close the second file with evict on close turned off
     conf.setBoolean("hbase.rs.evictblocksonclose", false);
-    cacheConf = new CacheConfig(conf);
+    cacheConf = new CacheConfig(conf, bc);
     hsf = new HStoreFile(this.fs, pathCowOn, conf, cacheConf, BloomType.NONE, true);
     hsf.initReader();
     reader = hsf.getReader();

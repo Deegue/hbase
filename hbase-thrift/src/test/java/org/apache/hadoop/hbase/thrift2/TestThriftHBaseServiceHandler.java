@@ -18,6 +18,8 @@
 package org.apache.hadoop.hbase.thrift2;
 
 import static java.nio.ByteBuffer.wrap;
+import static org.apache.hadoop.hbase.thrift.HBaseServiceHandler.CLEANUP_INTERVAL;
+import static org.apache.hadoop.hbase.thrift.HBaseServiceHandler.MAX_IDLETIME;
 import static org.apache.hadoop.hbase.thrift2.ThriftUtilities.deleteFromThrift;
 import static org.apache.hadoop.hbase.thrift2.ThriftUtilities.getFromThrift;
 import static org.apache.hadoop.hbase.thrift2.ThriftUtilities.incrementFromThrift;
@@ -32,6 +34,7 @@ import static org.junit.Assert.fail;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -60,6 +63,7 @@ import org.apache.hadoop.hbase.client.Increment;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.Table;
+import org.apache.hadoop.hbase.client.TableDescriptor;
 import org.apache.hadoop.hbase.coprocessor.ObserverContext;
 import org.apache.hadoop.hbase.coprocessor.RegionCoprocessor;
 import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
@@ -70,13 +74,18 @@ import org.apache.hadoop.hbase.test.MetricsAssertHelper;
 import org.apache.hadoop.hbase.testclassification.ClientTests;
 import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.thrift.ErrorThrowingGetObserver;
+import org.apache.hadoop.hbase.thrift.HBaseThriftTestingUtility;
+import org.apache.hadoop.hbase.thrift.HbaseHandlerMetricsProxy;
 import org.apache.hadoop.hbase.thrift.ThriftMetrics;
+import org.apache.hadoop.hbase.thrift.ThriftMetrics.ThriftServerType;
 import org.apache.hadoop.hbase.thrift2.generated.TAppend;
 import org.apache.hadoop.hbase.thrift2.generated.TColumn;
+import org.apache.hadoop.hbase.thrift2.generated.TColumnFamilyDescriptor;
 import org.apache.hadoop.hbase.thrift2.generated.TColumnIncrement;
 import org.apache.hadoop.hbase.thrift2.generated.TColumnValue;
-import org.apache.hadoop.hbase.thrift2.generated.TCompareOp;
+import org.apache.hadoop.hbase.thrift2.generated.TCompareOperator;
 import org.apache.hadoop.hbase.thrift2.generated.TConsistency;
+import org.apache.hadoop.hbase.thrift2.generated.TDataBlockEncoding;
 import org.apache.hadoop.hbase.thrift2.generated.TDelete;
 import org.apache.hadoop.hbase.thrift2.generated.TDeleteType;
 import org.apache.hadoop.hbase.thrift2.generated.TDurability;
@@ -86,14 +95,22 @@ import org.apache.hadoop.hbase.thrift2.generated.TIOError;
 import org.apache.hadoop.hbase.thrift2.generated.TIllegalArgument;
 import org.apache.hadoop.hbase.thrift2.generated.TIncrement;
 import org.apache.hadoop.hbase.thrift2.generated.TMutation;
+import org.apache.hadoop.hbase.thrift2.generated.TNamespaceDescriptor;
 import org.apache.hadoop.hbase.thrift2.generated.TPut;
 import org.apache.hadoop.hbase.thrift2.generated.TReadType;
 import org.apache.hadoop.hbase.thrift2.generated.TResult;
 import org.apache.hadoop.hbase.thrift2.generated.TRowMutations;
 import org.apache.hadoop.hbase.thrift2.generated.TScan;
+import org.apache.hadoop.hbase.thrift2.generated.TTableDescriptor;
+import org.apache.hadoop.hbase.thrift2.generated.TTableName;
+import org.apache.hadoop.hbase.thrift2.generated.TThriftServerType;
 import org.apache.hadoop.hbase.thrift2.generated.TTimeRange;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.thrift.TException;
+import org.apache.thrift.protocol.TBinaryProtocol;
+import org.apache.thrift.protocol.TProtocol;
+import org.apache.thrift.transport.TSocket;
+import org.apache.thrift.transport.TTransport;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -109,7 +126,7 @@ import org.apache.hbase.thirdparty.com.google.common.collect.Lists;
 import org.apache.hbase.thirdparty.org.apache.commons.collections4.CollectionUtils;
 
 /**
- * Unit testing for ThriftServer.HBaseHandler, a part of the org.apache.hadoop.hbase.thrift2
+ * Unit testing for ThriftServer.HBaseServiceHandler, a part of the org.apache.hadoop.hbase.thrift2
  * package.
  */
 @Category({ClientTests.class, MediumTests.class})
@@ -743,8 +760,8 @@ public class TestThriftHBaseServiceHandler {
     int cleanUpInterval = 100;
     Configuration conf = new Configuration(UTIL.getConfiguration());
     // Set the ConnectionCache timeout to trigger halfway through the trials
-    conf.setInt(ThriftHBaseServiceHandler.MAX_IDLETIME, (numTrials / 2) * trialPause);
-    conf.setInt(ThriftHBaseServiceHandler.CLEANUP_INTERVAL, cleanUpInterval);
+    conf.setInt(MAX_IDLETIME, (numTrials / 2) * trialPause);
+    conf.setInt(CLEANUP_INTERVAL, cleanUpInterval);
     ThriftHBaseServiceHandler handler = new ThriftHBaseServiceHandler(conf,
         UserProvider.instantiate(conf));
 
@@ -1200,7 +1217,7 @@ public class TestThriftHBaseServiceHandler {
     ThriftMetrics metrics = getMetrics(conf);
     ThriftHBaseServiceHandler hbaseHandler = createHandler();
     THBaseService.Iface handler =
-        ThriftHBaseServiceHandler.newInstance(hbaseHandler, metrics);
+        HbaseHandlerMetricsProxy.newInstance(hbaseHandler, metrics,  conf);
     byte[] rowName = Bytes.toBytes("testMetrics");
     ByteBuffer table = wrap(tableAname);
 
@@ -1243,7 +1260,7 @@ public class TestThriftHBaseServiceHandler {
     ThriftHBaseServiceHandler hbaseHandler = createHandler();
     ThriftMetrics metrics = getMetrics(UTIL.getConfiguration());
     THBaseService.Iface handler =
-        ThriftHBaseServiceHandler.newInstance(hbaseHandler, metrics);
+        HbaseHandlerMetricsProxy.newInstance(hbaseHandler, metrics, null);
     ByteBuffer tTableName = wrap(tableName.getName());
 
     // check metrics increment with a successful get
@@ -1317,7 +1334,7 @@ public class TestThriftHBaseServiceHandler {
       ThriftHBaseServiceHandler hbaseHandler = createHandler();
       ThriftMetrics metrics = getMetrics(UTIL.getConfiguration());
       THBaseService.Iface handler =
-          ThriftHBaseServiceHandler.newInstance(hbaseHandler, metrics);
+          HbaseHandlerMetricsProxy.newInstance(hbaseHandler, metrics, null);
       ByteBuffer tTableName = wrap(tableName.getName());
 
       // check metrics latency with a successful get
@@ -1535,7 +1552,7 @@ public class TestThriftHBaseServiceHandler {
 
     // checkAndMutate -- condition should fail because the value doesn't exist.
     assertFalse("Expected condition to not pass",
-        handler.checkAndMutate(table, row, family, qualifier, TCompareOp.EQUAL, value,
+        handler.checkAndMutate(table, row, family, qualifier, TCompareOperator.EQUAL, value,
             tRowMutations));
 
     List<TColumnValue> columnValuesA = new ArrayList<>(1);
@@ -1552,7 +1569,7 @@ public class TestThriftHBaseServiceHandler {
 
     // checkAndMutate -- condition should pass since we added the value
     assertTrue("Expected condition to pass",
-        handler.checkAndMutate(table, row, family, qualifier, TCompareOp.EQUAL, value,
+        handler.checkAndMutate(table, row, family, qualifier, TCompareOperator.EQUAL, value,
             tRowMutations));
 
     result = handler.get(table, new TGet(row));
@@ -1590,6 +1607,126 @@ public class TestThriftHBaseServiceHandler {
     assertFalse(tResult.isSetStale());
     tResult.setStale(true);
     assertTrue(tResult.isSetStale());
+  }
+
+  @Test
+  public void testDDLOpertions() throws Exception {
+    String namespace = "testDDLOpertionsNamespace";
+    String table = "testDDLOpertionsTable";
+    TTableName tTableName = new TTableName();
+    tTableName.setNs(Bytes.toBytes(namespace));
+    tTableName.setQualifier(Bytes.toBytes(table));
+    ThriftHBaseServiceHandler handler = createHandler();
+    //create name space
+    TNamespaceDescriptor namespaceDescriptor = new TNamespaceDescriptor();
+    namespaceDescriptor.setName(namespace);
+    namespaceDescriptor.putToConfiguration("key1", "value1");
+    namespaceDescriptor.putToConfiguration("key2", "value2");
+    handler.createNamespace(namespaceDescriptor);
+    //list namespace
+    List<TNamespaceDescriptor> namespaceDescriptors = handler.listNamespaceDescriptors();
+    // should have 3 namespace, default hbase and testDDLOpertionsNamespace
+    assertTrue(namespaceDescriptors.size() == 3);
+    //modify namesapce
+    namespaceDescriptor.putToConfiguration("kye3", "value3");
+    handler.modifyNamespace(namespaceDescriptor);
+    //get namespace
+    TNamespaceDescriptor namespaceDescriptorReturned = handler.getNamespaceDescriptor(namespace);
+    assertTrue(namespaceDescriptorReturned.getConfiguration().size() == 3);
+    //create table
+    TTableDescriptor tableDescriptor = new TTableDescriptor();
+    tableDescriptor.setTableName(tTableName);
+    TColumnFamilyDescriptor columnFamilyDescriptor1 = new TColumnFamilyDescriptor();
+    columnFamilyDescriptor1.setName(familyAname);
+    columnFamilyDescriptor1.setDataBlockEncoding(TDataBlockEncoding.DIFF);
+    tableDescriptor.addToColumns(columnFamilyDescriptor1);
+    List<ByteBuffer> splitKeys = new ArrayList<>();
+    splitKeys.add(ByteBuffer.wrap(Bytes.toBytes(5)));
+    handler.createTable(tableDescriptor, splitKeys);
+    //modify table
+    tableDescriptor.setDurability(TDurability.ASYNC_WAL);
+    handler.modifyTable(tableDescriptor);
+    //modify column family
+    columnFamilyDescriptor1.setInMemory(true);
+    handler.modifyColumnFamily(tTableName, columnFamilyDescriptor1);
+    //add column family
+    TColumnFamilyDescriptor columnFamilyDescriptor2 = new TColumnFamilyDescriptor();
+    columnFamilyDescriptor2.setName(familyBname);
+    columnFamilyDescriptor2.setDataBlockEncoding(TDataBlockEncoding.PREFIX);
+    handler.addColumnFamily(tTableName, columnFamilyDescriptor2);
+    //get table descriptor
+    TTableDescriptor tableDescriptorReturned = handler.getTableDescriptor(tTableName);
+    assertTrue(tableDescriptorReturned.getColumns().size() == 2);
+    assertTrue(tableDescriptorReturned.getDurability() ==  TDurability.ASYNC_WAL);
+    TColumnFamilyDescriptor columnFamilyDescriptor1Returned = tableDescriptorReturned.getColumns()
+        .stream().filter(desc -> Bytes.equals(desc.getName(), familyAname)).findFirst().get();
+    assertTrue(columnFamilyDescriptor1Returned.isInMemory() == true);
+    //delete column family
+    handler.deleteColumnFamily(tTableName, ByteBuffer.wrap(familyBname));
+    tableDescriptorReturned = handler.getTableDescriptor(tTableName);
+    assertTrue(tableDescriptorReturned.getColumns().size() == 1);
+    //disable table
+    handler.disableTable(tTableName);
+    assertTrue(handler.isTableDisabled(tTableName));
+    //enable table
+    handler.enableTable(tTableName);
+    assertTrue(handler.isTableEnabled(tTableName));
+    assertTrue(handler.isTableAvailable(tTableName));
+    //truncate table
+    handler.disableTable(tTableName);
+    handler.truncateTable(tTableName, true);
+    assertTrue(handler.isTableAvailable(tTableName));
+    //delete table
+    handler.disableTable(tTableName);
+    handler.deleteTable(tTableName);
+    assertFalse(handler.tableExists(tTableName));
+    //delete namespace
+    handler.deleteNamespace(namespace);
+    namespaceDescriptors = handler.listNamespaceDescriptors();
+    // should have 2 namespace, default and hbase
+    assertTrue(namespaceDescriptors.size() == 2);
+  }
+
+  @Test
+  public void testGetTableDescriptor() throws Exception {
+    ThriftHBaseServiceHandler handler = createHandler();
+    TTableDescriptor tableDescriptor = handler
+        .getTableDescriptor(ThriftUtilities.tableNameFromHBase(TableName.valueOf(tableAname)));
+    TableDescriptor table = ThriftUtilities.tableDescriptorFromThrift(tableDescriptor);
+    assertTrue(table.getTableName().equals(TableName.valueOf(tableAname)));
+    assertTrue(table.getColumnFamilies().length == 2);
+    assertTrue(table.getColumnFamily(familyAname).getMaxVersions() == 3);
+    assertTrue(table.getColumnFamily(familyBname).getMaxVersions() == 2);
+  }
+
+  @Test
+  public void testGetThriftServerType() throws Exception {
+    ThriftHBaseServiceHandler handler = createHandler();
+    assertEquals(TThriftServerType.TWO, handler.getThriftServerType());
+  }
+
+  /**
+   * Verify that thrift2 client calling thrift server can get the thrift server type correctly.
+   */
+  @Test
+  public void testGetThriftServerOneType() throws Exception {
+
+    // start a thrift server
+    HBaseThriftTestingUtility THRIFT_TEST_UTIL = new HBaseThriftTestingUtility();
+
+    LOG.info("Starting HBase Thrift server One");
+    THRIFT_TEST_UTIL.startThriftServer(UTIL.getConfiguration(), ThriftServerType.ONE);
+    try (TTransport transport = new TSocket(InetAddress.getLocalHost().getHostName(),
+        THRIFT_TEST_UTIL.getServerPort())){
+      TProtocol protocol = new TBinaryProtocol(transport);
+      // This is our thrift2 client.
+      THBaseService.Iface client = new THBaseService.Client(protocol);
+      // open the transport
+      transport.open();
+      assertEquals(TThriftServerType.ONE.name(), client.getThriftServerType().name());
+    } finally {
+      THRIFT_TEST_UTIL.stopThriftServer();
+    }
   }
 
   public static class DelayingRegionObserver implements RegionCoprocessor, RegionObserver {

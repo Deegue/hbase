@@ -59,6 +59,15 @@ public class RegionState {
                        // apply it to a region in this state, as it may lead to data loss as we
                        // may have some data in recovered edits.
 
+    public boolean matches(State... expected) {
+      for (State state : expected) {
+        if (this == state) {
+          return true;
+        }
+      }
+      return false;
+    }
+
     /**
      * Convert to protobuf ClusterStatusProtos.RegionState.State
      */
@@ -237,6 +246,10 @@ public class RegionState {
 
   public boolean isClosed() {
     return state == State.CLOSED;
+  }
+
+  public boolean isClosedOrAbnormallyClosed() {
+    return isClosed() || this.state == State.ABNORMALLY_CLOSED;
   }
 
   public boolean isOpening() {

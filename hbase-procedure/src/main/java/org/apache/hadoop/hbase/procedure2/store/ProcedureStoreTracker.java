@@ -15,7 +15,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.hadoop.hbase.procedure2.store;
 
 import java.io.IOException;
@@ -23,9 +22,12 @@ import java.util.Arrays;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.function.BiFunction;
 import java.util.stream.LongStream;
+import org.apache.hadoop.hbase.procedure2.Procedure;
 import org.apache.yetus.audience.InterfaceAudience;
-import org.apache.yetus.audience.InterfaceStability;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.hadoop.hbase.shaded.protobuf.generated.ProcedureProtos;
 
@@ -36,8 +38,9 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.ProcedureProtos;
  * deleted/completed to avoid the deserialization step on restart
  */
 @InterfaceAudience.Private
-@InterfaceStability.Evolving
 public class ProcedureStoreTracker {
+  private static final Logger LOG = LoggerFactory.getLogger(ProcedureStoreTracker.class);
+
   // Key is procedure id corresponding to first bit of the bitmap.
   private final TreeMap<Long, BitSetNode> map = new TreeMap<>();
 
@@ -63,7 +66,8 @@ public class ProcedureStoreTracker {
 
   public void resetToProto(ProcedureProtos.ProcedureStoreTracker trackerProtoBuf) {
     reset();
-    for (ProcedureProtos.ProcedureStoreTracker.TrackerNode protoNode: trackerProtoBuf.getNodeList()) {
+    for (ProcedureProtos.ProcedureStoreTracker.TrackerNode protoNode :
+            trackerProtoBuf.getNodeList()) {
       final BitSetNode node = new BitSetNode(protoNode);
       map.put(node.getStart(), node);
     }
@@ -86,7 +90,10 @@ public class ProcedureStoreTracker {
    */
   public void resetTo(ProcedureStoreTracker tracker, boolean resetDelete) {
     reset();
-    this.partial = tracker.partial;
+    // resetDelete will true if we are building the cleanup tracker, as we will reset deleted flags
+    // for all the unmodified bits to 1, the partial flag is useless so set it to false for not
+    // confusing the developers when debugging.
+    this.partial = resetDelete ? false : tracker.partial;
     this.minModifiedProcId = tracker.minModifiedProcId;
     this.maxModifiedProcId = tracker.maxModifiedProcId;
     this.keepDeletes = tracker.keepDeletes;
@@ -129,6 +136,9 @@ public class ProcedureStoreTracker {
     node = lookupClosestNode(node, procId);
     assert node != null : "expected node to update procId=" + procId;
     assert node.contains(procId) : "expected procId=" + procId + " in the node";
+    if (node == null) {
+      throw new NullPointerException("pid=" + procId);
+    }
     node.insertOrUpdate(procId);
     trackProcIds(procId);
     return node;
@@ -148,8 +158,10 @@ public class ProcedureStoreTracker {
 
   private BitSetNode delete(BitSetNode node, long procId) {
     node = lookupClosestNode(node, procId);
-    assert node != null : "expected node to delete procId=" + procId;
-    assert node.contains(procId) : "expected procId=" + procId + " in the node";
+    if (node == null || !node.contains(procId)) {
+      LOG.warn("The BitSetNode for procId={} does not exist, maybe a double deletion?", procId);
+      return node;
+    }
     node.delete(procId);
     if (!keepDeletes && node.isEmpty()) {
       // TODO: RESET if (map.size() == 1)
@@ -196,6 +208,35 @@ public class ProcedureStoreTracker {
     }
   }
 
+  private void setDeleteIf(ProcedureStoreTracker tracker,
+      BiFunction<BitSetNode, Long, Boolean> func) {
+    BitSetNode trackerNode = null;
+    for (BitSetNode node : map.values()) {
+      long minProcId = node.getStart();
+      long maxProcId = node.getEnd();
+      for (long procId = minProcId; procId <= maxProcId; ++procId) {
+        if (!node.isModified(procId)) {
+          continue;
+        }
+
+        trackerNode = tracker.lookupClosestNode(trackerNode, procId);
+        if (func.apply(trackerNode, procId)) {
+          node.delete(procId);
+        }
+      }
+    }
+  }
+
+  /**
+   * For the global tracker, we will use this method to build the holdingCleanupTracker, as the
+   * modified flags will be cleared after rolling so we only need to test the deleted flags.
+   * @see #setDeletedIfModifiedInBoth(ProcedureStoreTracker)
+   */
+  public void setDeletedIfDeletedByThem(ProcedureStoreTracker tracker) {
+    setDeleteIf(tracker, (node, procId) -> node == null || !node.contains(procId) ||
+      node.isDeleted(procId) == DeleteState.YES);
+  }
+
   /**
    * Similar with {@link #setDeletedIfModified(long...)}, but here the {@code procId} are given by
    * the {@code tracker}. If a procedure is modified by us, and also by the given {@code tracker},
@@ -203,23 +244,7 @@ public class ProcedureStoreTracker {
    * @see #setDeletedIfModified(long...)
    */
   public void setDeletedIfModifiedInBoth(ProcedureStoreTracker tracker) {
-    BitSetNode trackerNode = null;
-    for (BitSetNode node : map.values()) {
-      final long minProcId = node.getStart();
-      final long maxProcId = node.getEnd();
-      for (long procId = minProcId; procId <= maxProcId; ++procId) {
-        if (!node.isModified(procId)) {
-          continue;
-        }
-
-        trackerNode = tracker.lookupClosestNode(trackerNode, procId);
-        if (trackerNode == null || !trackerNode.contains(procId) ||
-          trackerNode.isModified(procId)) {
-          // the procedure was removed or modified
-          node.delete(procId);
-        }
-      }
-    }
+    setDeleteIf(tracker, (node, procId) -> node != null && node.isModified(procId));
   }
 
   /**
@@ -229,7 +254,10 @@ public class ProcedureStoreTracker {
    * @return the node that may contains the procId or null
    */
   private BitSetNode lookupClosestNode(final BitSetNode node, final long procId) {
-    if (node != null && node.contains(procId)) return node;
+    if (node != null && node.contains(procId)) {
+      return node;
+    }
+
     final Map.Entry<Long, BitSetNode> entry = map.floorEntry(procId);
     return entry != null ? entry.getValue() : null;
   }
@@ -251,7 +279,8 @@ public class ProcedureStoreTracker {
     this.keepDeletes = false;
     this.partial = false;
     this.map.clear();
-    resetModified();
+    minModifiedProcId = Long.MAX_VALUE;
+    maxModifiedProcId = Long.MIN_VALUE;
   }
 
   public boolean isModified(long procId) {
@@ -278,9 +307,8 @@ public class ProcedureStoreTracker {
   }
 
   public long getActiveMinProcId() {
-    // TODO: Cache?
     Map.Entry<Long, BitSetNode> entry = map.firstEntry();
-    return entry == null ? 0 : entry.getValue().getActiveMinProcId();
+    return entry == null ? Procedure.NO_PROC_ID : entry.getValue().getActiveMinProcId();
   }
 
   public void setKeepDeletes(boolean keepDeletes) {

@@ -29,7 +29,6 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -76,6 +75,7 @@ import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.CompareOperator;
 import org.apache.hadoop.hbase.CompatibilitySingletonFactory;
 import org.apache.hadoop.hbase.DroppedSnapshotException;
+import org.apache.hadoop.hbase.ExtendedCellBuilderFactory;
 import org.apache.hadoop.hbase.HBaseClassTestRule;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
@@ -86,7 +86,6 @@ import org.apache.hadoop.hbase.HDFSBlocksDistribution;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
-import org.apache.hadoop.hbase.KeyValueUtil;
 import org.apache.hadoop.hbase.MiniHBaseCluster;
 import org.apache.hadoop.hbase.MultithreadedTestUtil;
 import org.apache.hadoop.hbase.MultithreadedTestUtil.RepeatingTestThread;
@@ -101,6 +100,7 @@ import org.apache.hadoop.hbase.TagType;
 import org.apache.hadoop.hbase.Waiter;
 import org.apache.hadoop.hbase.client.Append;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptor;
+import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Durability;
 import org.apache.hadoop.hbase.client.Get;
@@ -114,12 +114,12 @@ import org.apache.hadoop.hbase.client.RowMutations;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.Table;
 import org.apache.hadoop.hbase.client.TableDescriptor;
+import org.apache.hadoop.hbase.client.TableDescriptorBuilder;
 import org.apache.hadoop.hbase.coprocessor.CoprocessorHost;
 import org.apache.hadoop.hbase.exceptions.FailedSanityCheckException;
 import org.apache.hadoop.hbase.filter.BigDecimalComparator;
 import org.apache.hadoop.hbase.filter.BinaryComparator;
 import org.apache.hadoop.hbase.filter.ColumnCountGetFilter;
-import org.apache.hadoop.hbase.filter.CompareFilter.CompareOp;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.filter.FilterBase;
 import org.apache.hadoop.hbase.filter.FilterList;
@@ -147,21 +147,24 @@ import org.apache.hadoop.hbase.test.MetricsAssertHelper;
 import org.apache.hadoop.hbase.testclassification.LargeTests;
 import org.apache.hadoop.hbase.testclassification.VerySlowRegionServerTests;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.CommonFSUtils;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManagerTestHelper;
 import org.apache.hadoop.hbase.util.FSUtils;
+import org.apache.hadoop.hbase.util.HFileArchiveUtil;
 import org.apache.hadoop.hbase.util.IncrementingEnvironmentEdge;
 import org.apache.hadoop.hbase.util.ManualEnvironmentEdge;
 import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.hbase.wal.AbstractFSWALProvider;
 import org.apache.hadoop.hbase.wal.FaultyFSLog;
+import org.apache.hadoop.hbase.wal.NettyAsyncFSWALConfigHelper;
 import org.apache.hadoop.hbase.wal.WAL;
 import org.apache.hadoop.hbase.wal.WALEdit;
 import org.apache.hadoop.hbase.wal.WALFactory;
 import org.apache.hadoop.hbase.wal.WALKeyImpl;
 import org.apache.hadoop.hbase.wal.WALProvider;
 import org.apache.hadoop.hbase.wal.WALProvider.Writer;
-import org.apache.hadoop.hbase.wal.WALSplitter;
+import org.apache.hadoop.hbase.wal.WALSplitUtil;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -181,6 +184,9 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.hbase.thirdparty.com.google.common.collect.Lists;
 import org.apache.hbase.thirdparty.com.google.protobuf.ByteString;
+import org.apache.hbase.thirdparty.io.netty.channel.EventLoopGroup;
+import org.apache.hbase.thirdparty.io.netty.channel.nio.NioEventLoopGroup;
+import org.apache.hbase.thirdparty.io.netty.channel.socket.nio.NioSocketChannel;
 
 import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos.CompactionDescriptor;
@@ -213,6 +219,7 @@ public class TestHRegion {
 
   private static final String COLUMN_FAMILY = "MyCF";
   private static final byte [] COLUMN_FAMILY_BYTES = Bytes.toBytes(COLUMN_FAMILY);
+  private static final EventLoopGroup GROUP = new NioEventLoopGroup();
 
   HRegion region = null;
   // Do not run unit tests in parallel (? Why not?  It don't work?  Why not?  St.Ack)
@@ -241,6 +248,7 @@ public class TestHRegion {
   public void setup() throws IOException {
     TEST_UTIL = HBaseTestingUtility.createLocalHTU();
     CONF = TEST_UTIL.getConfiguration();
+    NettyAsyncFSWALConfigHelper.setEventLoopConfig(CONF, GROUP, NioSocketChannel.class);
     dir = TEST_UTIL.getDataTestDir("TestHRegion").toString();
     method = name.getMethodName();
     tableName = TableName.valueOf(method);
@@ -672,6 +680,60 @@ public class TestHRegion {
   }
 
   @Test
+  public void testArchiveRecoveredEditsReplay() throws Exception {
+    byte[] family = Bytes.toBytes("family");
+    this.region = initHRegion(tableName, method, CONF, family);
+    final WALFactory wals = new WALFactory(CONF, method);
+    try {
+      Path regiondir = region.getRegionFileSystem().getRegionDir();
+      FileSystem fs = region.getRegionFileSystem().getFileSystem();
+      byte[] regionName = region.getRegionInfo().getEncodedNameAsBytes();
+
+      Path recoveredEditsDir = WALSplitUtil.getRegionDirRecoveredEditsDir(regiondir);
+
+      long maxSeqId = 1050;
+      long minSeqId = 1000;
+
+      for (long i = minSeqId; i <= maxSeqId; i += 10) {
+        Path recoveredEdits = new Path(recoveredEditsDir, String.format("%019d", i));
+        fs.create(recoveredEdits);
+        WALProvider.Writer writer = wals.createRecoveredEditsWriter(fs, recoveredEdits);
+
+        long time = System.nanoTime();
+        WALEdit edit = new WALEdit();
+        edit.add(new KeyValue(row, family, Bytes.toBytes(i), time, KeyValue.Type.Put, Bytes
+          .toBytes(i)));
+        writer.append(new WAL.Entry(new WALKeyImpl(regionName, tableName, i, time,
+          HConstants.DEFAULT_CLUSTER_ID), edit));
+
+        writer.close();
+      }
+      MonitoredTask status = TaskMonitor.get().createStatus(method);
+      Map<byte[], Long> maxSeqIdInStores = new TreeMap<>(Bytes.BYTES_COMPARATOR);
+      for (HStore store : region.getStores()) {
+        maxSeqIdInStores.put(Bytes.toBytes(store.getColumnFamilyName()), minSeqId - 1);
+      }
+      CONF.set("hbase.region.archive.recovered.edits", "true");
+      CONF.set(CommonFSUtils.HBASE_WAL_DIR, "/custom_wal_dir");
+      long seqId = region.replayRecoveredEditsIfAny(maxSeqIdInStores, null, status);
+      assertEquals(maxSeqId, seqId);
+      region.getMVCC().advanceTo(seqId);
+      String fakeFamilyName = recoveredEditsDir.getName();
+      Path rootDir = new Path(CONF.get(HConstants.HBASE_DIR));
+      Path storeArchiveDir = HFileArchiveUtil.getStoreArchivePathForRootDir(rootDir,
+        region.getRegionInfo(), Bytes.toBytes(fakeFamilyName));
+      FileStatus[] list = TEST_UTIL.getTestFileSystem().listStatus(storeArchiveDir);
+      assertEquals(6, list.length);
+    } finally {
+      CONF.set("hbase.region.archive.recovered.edits", "false");
+      CONF.set(CommonFSUtils.HBASE_WAL_DIR, "");
+      HBaseTestingUtility.closeRegionAndWAL(this.region);
+      this.region = null;
+      wals.close();
+    }
+  }
+
+  @Test
   public void testSkipRecoveredEditsReplay() throws Exception {
     byte[] family = Bytes.toBytes("family");
     this.region = initHRegion(tableName, method, CONF, family);
@@ -681,7 +743,7 @@ public class TestHRegion {
       FileSystem fs = region.getRegionFileSystem().getFileSystem();
       byte[] regionName = region.getRegionInfo().getEncodedNameAsBytes();
 
-      Path recoveredEditsDir = WALSplitter.getRegionDirRecoveredEditsDir(regiondir);
+      Path recoveredEditsDir = WALSplitUtil.getRegionDirRecoveredEditsDir(regiondir);
 
       long maxSeqId = 1050;
       long minSeqId = 1000;
@@ -732,7 +794,7 @@ public class TestHRegion {
       FileSystem fs = region.getRegionFileSystem().getFileSystem();
       byte[] regionName = region.getRegionInfo().getEncodedNameAsBytes();
 
-      Path recoveredEditsDir = WALSplitter.getRegionDirRecoveredEditsDir(regiondir);
+      Path recoveredEditsDir = WALSplitUtil.getRegionDirRecoveredEditsDir(regiondir);
 
       long maxSeqId = 1050;
       long minSeqId = 1000;
@@ -785,7 +847,7 @@ public class TestHRegion {
     Path regiondir = region.getRegionFileSystem().getRegionDir();
     FileSystem fs = region.getRegionFileSystem().getFileSystem();
 
-    Path recoveredEditsDir = WALSplitter.getRegionDirRecoveredEditsDir(regiondir);
+    Path recoveredEditsDir = WALSplitUtil.getRegionDirRecoveredEditsDir(regiondir);
     for (int i = 1000; i < 1050; i += 10) {
       Path recoveredEdits = new Path(recoveredEditsDir, String.format("%019d", i));
       FSDataOutputStream dos = fs.create(recoveredEdits);
@@ -818,7 +880,7 @@ public class TestHRegion {
 
       assertEquals(0, region.getStoreFileList(columns).size());
 
-      Path recoveredEditsDir = WALSplitter.getRegionDirRecoveredEditsDir(regiondir);
+      Path recoveredEditsDir = WALSplitUtil.getRegionDirRecoveredEditsDir(regiondir);
 
       long maxSeqId = 1050;
       long minSeqId = 1000;
@@ -934,7 +996,7 @@ public class TestHRegion {
       WALUtil.writeCompactionMarker(region.getWAL(), this.region.getReplicationScope(),
           this.region.getRegionInfo(), compactionDescriptor, region.getMVCC());
 
-      Path recoveredEditsDir = WALSplitter.getRegionDirRecoveredEditsDir(regiondir);
+      Path recoveredEditsDir = WALSplitUtil.getRegionDirRecoveredEditsDir(regiondir);
 
       Path recoveredEdits = new Path(recoveredEditsDir, String.format("%019d", 1000));
       fs.create(recoveredEdits);
@@ -1059,7 +1121,7 @@ public class TestHRegion {
 
         // now write those markers to the recovered edits again.
 
-        Path recoveredEditsDir = WALSplitter.getRegionDirRecoveredEditsDir(regiondir);
+        Path recoveredEditsDir = WALSplitUtil.getRegionDirRecoveredEditsDir(regiondir);
 
         Path recoveredEdits = new Path(recoveredEditsDir, String.format("%019d", 1000));
         fs.create(recoveredEdits);
@@ -1227,10 +1289,9 @@ public class TestHRegion {
     this.region = initHRegion(tableName, HConstants.EMPTY_START_ROW,
       HConstants.EMPTY_END_ROW, false, Durability.USE_DEFAULT, wal, family);
     region.put(put);
-
     // 3. Test case where ABORT_FLUSH will throw exception.
     // Even if ABORT_FLUSH throws exception, we should not fail with IOE, but continue with
-    // DroppedSnapshotException. Below COMMMIT_FLUSH will cause flush to abort
+    // DroppedSnapshotException. Below COMMIT_FLUSH will cause flush to abort
     wal.flushActions = new FlushAction [] {FlushAction.COMMIT_FLUSH, FlushAction.ABORT_FLUSH};
 
     try {
@@ -1446,7 +1507,7 @@ public class TestHRegion {
     allFilters.addFilter(new PrefixFilter(Bytes.toBytes(keyPrefix)));
     // Only return rows where this column value exists in the row.
     SingleColumnValueFilter filter = new SingleColumnValueFilter(Bytes.toBytes("trans-tags"),
-        Bytes.toBytes("qual2"), CompareOp.EQUAL, Bytes.toBytes(value));
+        Bytes.toBytes("qual2"), CompareOperator.EQUAL, Bytes.toBytes(value));
     filter.setFilterIfMissing(true);
     allFilters.addFilter(filter);
     Scan scan = new Scan();
@@ -2359,17 +2420,28 @@ public class TestHRegion {
     hLog.init();
     // This chunk creation is done throughout the code base. Do we want to move it into core?
     // It is missing from this test. W/o it we NPE.
-    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false, 0, 0, 0, null);
     region = initHRegion(tableName, null, null, false, Durability.SYNC_WAL, hLog,
         COLUMN_FAMILY_BYTES);
 
-    Cell originalCell = CellUtil.createCell(row, COLUMN_FAMILY_BYTES, qual1,
-      System.currentTimeMillis(), KeyValue.Type.Put.getCode(), value1);
-    final long originalSize = KeyValueUtil.length(originalCell);
+    Cell originalCell = ExtendedCellBuilderFactory.create(CellBuilderType.DEEP_COPY)
+      .setRow(row)
+      .setFamily(COLUMN_FAMILY_BYTES)
+      .setQualifier(qual1)
+      .setTimestamp(System.currentTimeMillis())
+      .setType(KeyValue.Type.Put.getCode())
+      .setValue(value1)
+      .build();
+    final long originalSize = originalCell.getSerializedSize();
 
-    Cell addCell = CellUtil.createCell(row, COLUMN_FAMILY_BYTES, qual1,
-      System.currentTimeMillis(), KeyValue.Type.Put.getCode(), Bytes.toBytes("xxxxxxxxxx"));
-    final long addSize = KeyValueUtil.length(addCell);
+    Cell addCell = ExtendedCellBuilderFactory.create(CellBuilderType.DEEP_COPY)
+      .setRow(row)
+      .setFamily(COLUMN_FAMILY_BYTES)
+      .setQualifier(qual1)
+      .setTimestamp(System.currentTimeMillis())
+      .setType(KeyValue.Type.Put.getCode())
+      .setValue(Bytes.toBytes("xxxxxxxxxx"))
+      .build();
+    final long addSize = addCell.getSerializedSize();
 
     LOG.info("originalSize:" + originalSize
       + ", addSize:" + addSize);
@@ -2417,7 +2489,16 @@ public class TestHRegion {
         return null;
       }
     }).when(mockedCPHost).preBatchMutate(Mockito.isA(MiniBatchOperationInProgress.class));
+    ColumnFamilyDescriptorBuilder builder = ColumnFamilyDescriptorBuilder.
+        newBuilder(COLUMN_FAMILY_BYTES);
+    ScanInfo info = new ScanInfo(CONF, builder.build(), Long.MAX_VALUE,
+        Long.MAX_VALUE, region.getCellComparator());
+    Mockito.when(mockedCPHost.preFlushScannerOpen(Mockito.any(HStore.class),
+        Mockito.any())).thenReturn(info);
+    Mockito.when(mockedCPHost.preFlush(Mockito.any(), Mockito.any(StoreScanner.class),
+        Mockito.any())).thenAnswer(i -> i.getArgument(1));
     region.setCoprocessorHost(mockedCPHost);
+
     region.put(originalPut);
     region.setCoprocessorHost(normalCPHost);
     final long finalSize = region.getDataInMemoryWithoutWAL();
@@ -2628,12 +2709,12 @@ public class TestHRegion {
     region.put(put);
 
     Get get = new Get(row1);
-    get.setMaxVersions();
+    get.readAllVersions();
     Result res = region.get(get);
     // Get 3 versions, the oldest version has gone from user view
     assertEquals(maxVersions, res.size());
 
-    get.setFilter(new ValueFilter(CompareOp.EQUAL, new SubstringComparator("value")));
+    get.setFilter(new ValueFilter(CompareOperator.EQUAL, new SubstringComparator("value")));
     res = region.get(get);
     // When use value filter, the oldest version should still gone from user view and it
     // should only return one key vaule
@@ -3277,7 +3358,7 @@ public class TestHRegion {
 
     Scan scan = new Scan();
     Filter filter = new SingleColumnValueExcludeFilter(cf_essential, col_normal,
-        CompareOp.NOT_EQUAL, filtered_val);
+            CompareOperator.NOT_EQUAL, filtered_val);
     scan.setFilter(filter);
     scan.setLoadColumnFamiliesOnDemand(true);
     InternalScanner s = region.getScanner(scan);
@@ -3437,7 +3518,7 @@ public class TestHRegion {
 
       Scan scan = new Scan();
       scan.addFamily(family);
-      scan.setFilter(new SingleColumnValueFilter(family, qual1, CompareOp.EQUAL,
+      scan.setFilter(new SingleColumnValueFilter(family, qual1, CompareOperator.EQUAL,
           new BinaryComparator(Bytes.toBytes(5L))));
 
       int expectedCount = 0;
@@ -3876,9 +3957,9 @@ public class TestHRegion {
     Scan idxScan = new Scan();
     idxScan.addFamily(family);
     idxScan.setFilter(new FilterList(FilterList.Operator.MUST_PASS_ALL, Arrays.<Filter> asList(
-        new SingleColumnValueFilter(family, qual1, CompareOp.GREATER_OR_EQUAL,
+        new SingleColumnValueFilter(family, qual1, CompareOperator.GREATER_OR_EQUAL,
             new BinaryComparator(Bytes.toBytes(0L))), new SingleColumnValueFilter(family, qual1,
-            CompareOp.LESS_OR_EQUAL, new BinaryComparator(Bytes.toBytes(3L))))));
+                    CompareOperator.LESS_OR_EQUAL, new BinaryComparator(Bytes.toBytes(3L))))));
     InternalScanner scanner = region.getScanner(idxScan);
     List<Cell> res = new ArrayList<>();
 
@@ -3972,7 +4053,7 @@ public class TestHRegion {
 
     // Get rows
     Get get = new Get(row);
-    get.setMaxVersions();
+    get.readAllVersions();
     Cell[] kvs = region.get(get).rawCells();
 
     // Check if rows are correct
@@ -4255,7 +4336,7 @@ public class TestHRegion {
 
     Get get = new Get(Incrementer.incRow);
     get.addColumn(Incrementer.family, Incrementer.qualifier);
-    get.setMaxVersions(1);
+    get.readVersions(1);
     Result res = this.region.get(get);
     List<Cell> kvs = res.getColumnCells(Incrementer.family, Incrementer.qualifier);
 
@@ -4345,7 +4426,7 @@ public class TestHRegion {
 
     Get get = new Get(Appender.appendRow);
     get.addColumn(Appender.family, Appender.qualifier);
-    get.setMaxVersions(1);
+    get.readVersions(1);
     Result res = this.region.get(get);
     List<Cell> kvs = res.getColumnCells(Appender.family, Appender.qualifier);
 
@@ -4379,7 +4460,7 @@ public class TestHRegion {
     region.put(put);
     get = new Get(row);
     get.addColumn(family, qualifier);
-    get.setMaxVersions();
+    get.readAllVersions();
     res = this.region.get(get);
     kvs = res.getColumnCells(family, qualifier);
     assertEquals(1, kvs.size());
@@ -4388,7 +4469,7 @@ public class TestHRegion {
     region.flush(true);
     get = new Get(row);
     get.addColumn(family, qualifier);
-    get.setMaxVersions();
+    get.readAllVersions();
     res = this.region.get(get);
     kvs = res.getColumnCells(family, qualifier);
     assertEquals(1, kvs.size());
@@ -4400,7 +4481,7 @@ public class TestHRegion {
     region.put(put);
     get = new Get(row);
     get.addColumn(family, qualifier);
-    get.setMaxVersions();
+    get.readAllVersions();
     res = this.region.get(get);
     kvs = res.getColumnCells(family, qualifier);
     assertEquals(1, kvs.size());
@@ -4409,7 +4490,7 @@ public class TestHRegion {
     region.flush(true);
     get = new Get(row);
     get.addColumn(family, qualifier);
-    get.setMaxVersions();
+    get.readAllVersions();
     res = this.region.get(get);
     kvs = res.getColumnCells(family, qualifier);
     assertEquals(1, kvs.size());
@@ -4489,10 +4570,9 @@ public class TestHRegion {
     put.setDurability(mutationDurability);
     region.put(put);
 
-    //verify append called or not
-    verify(wal, expectAppend ? times(1) : never())
-      .append((HRegionInfo)any(), (WALKeyImpl)any(),
-          (WALEdit)any(), Mockito.anyBoolean());
+    // verify append called or not
+    verify(wal, expectAppend ? times(1) : never()).appendData((HRegionInfo) any(),
+      (WALKeyImpl) any(), (WALEdit) any());
 
     // verify sync called or not
     if (expectSync || expectSyncFromLogSyncer) {
@@ -4730,7 +4810,7 @@ public class TestHRegion {
 
   static void assertGet(final HRegion r, final byte[] family, final byte[] k) throws IOException {
     // Now I have k, get values out and assert they are as expected.
-    Get get = new Get(k).addFamily(family).setMaxVersions();
+    Get get = new Get(k).addFamily(family).readAllVersions();
     Cell[] results = r.get(get).rawCells();
     for (int j = 0; j < results.length; j++) {
       byte[] tmp = CellUtil.cloneValue(results[j]);
@@ -4848,7 +4928,6 @@ public class TestHRegion {
       String callingMethod, Configuration conf, boolean isReadOnly, byte[]... families)
       throws IOException {
     Path logDir = TEST_UTIL.getDataTestDirOnTestFS(callingMethod + ".log");
-    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false, 0, 0, 0, null);
     HRegionInfo hri = new HRegionInfo(tableName, startKey, stopKey);
     final WAL wal = HBaseTestingUtility.createWal(conf, logDir, hri);
     return initHRegion(tableName, startKey, stopKey, isReadOnly,
@@ -4861,6 +4940,7 @@ public class TestHRegion {
    */
   public HRegion initHRegion(TableName tableName, byte[] startKey, byte[] stopKey,
       boolean isReadOnly, Durability durability, WAL wal, byte[]... families) throws IOException {
+    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false, 0, 0, 0, null);
     return TEST_UTIL.createLocalHRegion(tableName, startKey, stopKey,
         isReadOnly, durability, wal, families);
   }
@@ -5534,6 +5614,46 @@ public class TestHRegion {
   }
 
   @Test
+  public void testReverseScanWhenPutCellsAfterOpenReverseScan() throws Exception {
+    byte[] cf1 = Bytes.toBytes("CF1");
+    byte[][] families = { cf1 };
+    byte[] col = Bytes.toBytes("C");
+
+    HBaseConfiguration conf = new HBaseConfiguration();
+    this.region = initHRegion(tableName, method, conf, families);
+
+    Put put = new Put(Bytes.toBytes("199996"));
+    put.addColumn(cf1, col, Bytes.toBytes("val"));
+    region.put(put);
+    Put put2 = new Put(Bytes.toBytes("199995"));
+    put2.addColumn(cf1, col, Bytes.toBytes("val"));
+    region.put(put2);
+
+    // Create a reverse scan
+    Scan scan = new Scan(Bytes.toBytes("199996"));
+    scan.setReversed(true);
+    RegionScannerImpl scanner = region.getScanner(scan);
+
+    // Put a lot of cells that have sequenceIDs grater than the readPt of the reverse scan
+    for (int i = 100000; i < 200000; i++) {
+      Put p = new Put(Bytes.toBytes("" + i));
+      p.addColumn(cf1, col, Bytes.toBytes("" + i));
+      region.put(p);
+    }
+    List<Cell> currRow = new ArrayList<>();
+    boolean hasNext;
+    do {
+      hasNext = scanner.next(currRow);
+    } while (hasNext);
+
+    assertEquals(2, currRow.size());
+    assertEquals("199996", Bytes.toString(currRow.get(0).getRowArray(),
+      currRow.get(0).getRowOffset(), currRow.get(0).getRowLength()));
+    assertEquals("199995", Bytes.toString(currRow.get(1).getRowArray(),
+      currRow.get(1).getRowOffset(), currRow.get(1).getRowLength()));
+  }
+
+  @Test
   public void testWriteRequestsCounter() throws IOException {
     byte[] fam = Bytes.toBytes("info");
     byte[][] families = { fam };
@@ -5561,12 +5681,10 @@ public class TestHRegion {
     final ServerName serverName = ServerName.valueOf(name.getMethodName(), 100, 42);
     final RegionServerServices rss = spy(TEST_UTIL.createMockRegionServerService(serverName));
 
-    HTableDescriptor htd = new HTableDescriptor(TableName.valueOf(name.getMethodName()));
-    htd.addFamily(new HColumnDescriptor(fam1));
-    htd.addFamily(new HColumnDescriptor(fam2));
-
-    HRegionInfo hri = new HRegionInfo(htd.getTableName(),
-      HConstants.EMPTY_BYTE_ARRAY, HConstants.EMPTY_BYTE_ARRAY);
+    TableDescriptor htd = TableDescriptorBuilder.newBuilder(TableName.valueOf(name.getMethodName()))
+      .setColumnFamily(ColumnFamilyDescriptorBuilder.of(fam1))
+      .setColumnFamily(ColumnFamilyDescriptorBuilder.of(fam2)).build();
+    RegionInfo hri = RegionInfoBuilder.newBuilder(htd.getTableName()).build();
 
     // open the region w/o rss and wal and flush some files
     region =
@@ -5583,13 +5701,13 @@ public class TestHRegion {
 
     // capture append() calls
     WAL wal = mockWAL();
-    when(rss.getWAL((HRegionInfo) any())).thenReturn(wal);
+    when(rss.getWAL(any(RegionInfo.class))).thenReturn(wal);
 
     region = HRegion.openHRegion(hri, htd, rss.getWAL(hri),
       TEST_UTIL.getConfiguration(), rss, null);
 
-    verify(wal, times(1)).append((HRegionInfo)any(), (WALKeyImpl)any()
-      , editCaptor.capture(), anyBoolean());
+    verify(wal, times(1)).appendMarker(any(RegionInfo.class), any(WALKeyImpl.class),
+      editCaptor.capture());
 
     WALEdit edit = editCaptor.getValue();
     assertNotNull(edit);
@@ -5655,15 +5773,14 @@ public class TestHRegion {
 
   /**
    * Utility method to setup a WAL mock.
+   * <p/>
    * Needs to do the bit where we close latch on the WALKeyImpl on append else test hangs.
    * @return a mock WAL
-   * @throws IOException
    */
   private WAL mockWAL() throws IOException {
     WAL wal = mock(WAL.class);
-    Mockito.when(wal.append((HRegionInfo)Mockito.any(),
-        (WALKeyImpl)Mockito.any(), (WALEdit)Mockito.any(), Mockito.anyBoolean())).
-      thenAnswer(new Answer<Long>() {
+    when(wal.appendData(any(RegionInfo.class), any(WALKeyImpl.class), any(WALEdit.class)))
+      .thenAnswer(new Answer<Long>() {
         @Override
         public Long answer(InvocationOnMock invocation) throws Throwable {
           WALKeyImpl key = invocation.getArgument(1);
@@ -5671,32 +5788,38 @@ public class TestHRegion {
           key.setWriteEntry(we);
           return 1L;
         }
-
-    });
+      });
+    when(wal.appendMarker(any(RegionInfo.class), any(WALKeyImpl.class), any(WALEdit.class))).
+        thenAnswer(new Answer<Long>() {
+          @Override
+          public Long answer(InvocationOnMock invocation) throws Throwable {
+            WALKeyImpl key = invocation.getArgument(1);
+            MultiVersionConcurrencyControl.WriteEntry we = key.getMvcc().begin();
+            key.setWriteEntry(we);
+            return 1L;
+          }
+        });
     return wal;
   }
 
   @Test
   public void testCloseRegionWrittenToWAL() throws Exception {
-
     Path rootDir = new Path(dir + name.getMethodName());
     FSUtils.setRootDir(TEST_UTIL.getConfiguration(), rootDir);
 
     final ServerName serverName = ServerName.valueOf("testCloseRegionWrittenToWAL", 100, 42);
     final RegionServerServices rss = spy(TEST_UTIL.createMockRegionServerService(serverName));
 
-    HTableDescriptor htd = new HTableDescriptor(TableName.valueOf(name.getMethodName()));
-    htd.addFamily(new HColumnDescriptor(fam1));
-    htd.addFamily(new HColumnDescriptor(fam2));
-
-    final HRegionInfo hri = new HRegionInfo(htd.getTableName(),
-      HConstants.EMPTY_BYTE_ARRAY, HConstants.EMPTY_BYTE_ARRAY);
+    TableDescriptor htd = TableDescriptorBuilder.newBuilder(TableName.valueOf(name.getMethodName()))
+      .setColumnFamily(ColumnFamilyDescriptorBuilder.of(fam1))
+      .setColumnFamily(ColumnFamilyDescriptorBuilder.of(fam2)).build();
+    RegionInfo hri = RegionInfoBuilder.newBuilder(htd.getTableName()).build();
 
     ArgumentCaptor<WALEdit> editCaptor = ArgumentCaptor.forClass(WALEdit.class);
 
     // capture append() calls
     WAL wal = mockWAL();
-    when(rss.getWAL((HRegionInfo) any())).thenReturn(wal);
+    when(rss.getWAL(any(RegionInfo.class))).thenReturn(wal);
 
 
     // create and then open a region first so that it can be closed later
@@ -5708,8 +5831,8 @@ public class TestHRegion {
     region.close(false);
 
     // 2 times, one for region open, the other close region
-    verify(wal, times(2)).append((HRegionInfo)any(), (WALKeyImpl)any(),
-      editCaptor.capture(), anyBoolean());
+    verify(wal, times(2)).appendMarker(any(RegionInfo.class),
+        (WALKeyImpl) any(WALKeyImpl.class), editCaptor.capture());
 
     WALEdit edit = editCaptor.getAllValues().get(1);
     assertNotNull(edit);
@@ -6261,17 +6384,17 @@ public class TestHRegion {
      * @return If Mob is enabled, return HMobStore, otherwise return HStoreForTesting.
      */
     @Override
-    protected HStore instantiateHStore(final ColumnFamilyDescriptor family) throws IOException {
+    protected HStore instantiateHStore(final ColumnFamilyDescriptor family, boolean warmup)
+        throws IOException {
       if (family.isMobEnabled()) {
         if (HFile.getFormatVersion(this.conf) < HFile.MIN_FORMAT_VERSION_WITH_TAGS) {
-          throw new IOException("A minimum HFile version of "
-              + HFile.MIN_FORMAT_VERSION_WITH_TAGS
-              + " is required for MOB feature. Consider setting " + HFile.FORMAT_VERSION_KEY
-              + " accordingly.");
+          throw new IOException("A minimum HFile version of " + HFile.MIN_FORMAT_VERSION_WITH_TAGS +
+              " is required for MOB feature. Consider setting " + HFile.FORMAT_VERSION_KEY +
+              " accordingly.");
         }
-        return new HMobStore(this, family, this.conf);
+        return new HMobStore(this, family, this.conf, warmup);
       }
-      return new HStoreForTesting(this, family, this.conf);
+      return new HStoreForTesting(this, family, this.conf, warmup);
     }
   }
 
@@ -6287,8 +6410,8 @@ public class TestHRegion {
 
     protected HStoreForTesting(final HRegion region,
         final ColumnFamilyDescriptor family,
-        final Configuration confParam) throws IOException {
-      super(region, family, confParam);
+        final Configuration confParam, boolean warmup) throws IOException {
+      super(region, family, confParam, warmup);
     }
 
     @Override

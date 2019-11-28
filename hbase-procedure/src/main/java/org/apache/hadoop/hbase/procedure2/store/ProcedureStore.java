@@ -15,14 +15,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.hadoop.hbase.procedure2.store;
 
 import java.io.IOException;
 
+import org.apache.hadoop.hbase.procedure2.Procedure;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
-import org.apache.hadoop.hbase.procedure2.Procedure;
 
 /**
  * The ProcedureStore is used by the executor to persist the state of each procedure execution.
@@ -85,12 +84,18 @@ public interface ProcedureStore {
     boolean hasNext();
 
     /**
+     * Calling this method does not need to convert the protobuf message to the Procedure class, so
+     * if it returns true we can call {@link #skipNext()} to skip the procedure without
+     * deserializing. This could increase the performance.
      * @return true if the iterator next element is a completed procedure.
      */
     boolean isNextFinished();
 
     /**
      * Skip the next procedure
+     * <p/>
+     * This method is used to skip the deserializing of the procedure to increase performance, as
+     * when calling next we need to convert the protobuf message to the Procedure class.
      */
     void skipNext();
 
@@ -143,7 +148,7 @@ public interface ProcedureStore {
 
   /**
    * Start/Open the procedure store
-   * @param numThreads
+   * @param numThreads number of threads to be used by the procedure store
    */
   void start(int numThreads) throws IOException;
 

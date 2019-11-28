@@ -50,12 +50,13 @@ import org.apache.hbase.thirdparty.com.google.common.cache.LoadingCache;
  * </p>
  * <p>
  * We record all the open sequence number for a region in a special family in meta, which is called
- * 'barrier', so there will be a sequence of open sequence number (b1, b2, b3, ...). We call [bn,
- * bn+1) a range, and it is obvious that a region will always be on the same RS within a range.
+ * 'rep_barrier', so there will be a sequence of open sequence number (b1, b2, b3, ...). We call
+ * [bn, bn+1) a range, and it is obvious that a region will always be on the same RS within a
+ * range.
  * <p>
  * When split and merge, we will also record the parent for the generated region(s) in the special
- * family in meta. And also, we will write an extra 'open sequence number' for the parent region(s),
- * which is the max sequence id of the region plus one.
+ * family in meta. And also, we will write an extra 'open sequence number' for the parent
+ * region(s), which is the max sequence id of the region plus one.
  * </p>
  * </p>
  * <p>
@@ -255,7 +256,7 @@ class SerialReplicationChecker {
     // has been moved to another RS and then back, so we need to check the barrier.
     MutableLong previousPushedSeqId = pushed.getUnchecked(encodedNameAsString);
     if (seqId == previousPushedSeqId.longValue() + 1) {
-      LOG.trace("The sequence id for {} is continuous, pass");
+      LOG.trace("The sequence id for {} is continuous, pass", entry);
       previousPushedSeqId.increment();
       return true;
     }
